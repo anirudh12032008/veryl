@@ -1254,17 +1254,22 @@ fn check_reset_non_elaborative(context: &mut Context, expr: &mut ir::Expression)
     } else {
         let mut specialized = Some(expr.clone());
         for (id, range) in context.for_ranges.clone() {
-            let Some(iterations) = range.eval_iter(context) else {
-                continue;
-            };
-            let Some(iteration) = iterations.first() else {
-                continue;
+            // A const bound without a value yet, like a proto package constant
+            // inside a generic, still makes the iterator elaborative; any value
+            // shows whether the rest is.
+            let iteration = match range.eval_iter(context) {
+                Some(iterations) => match iterations.first() {
+                    Some(x) => *x,
+                    None => continue,
+                },
+                None if range.has_const_bounds() => 0,
+                None => continue,
             };
             let variable = &context.variables[&id];
             let Some(width) = variable.r#type.total_width() else {
                 continue;
             };
-            let value = Value::new(*iteration as u64, width, variable.r#type.signed);
+            let value = Value::new(iteration as u64, width, variable.r#type.signed);
             specialized = specialized
                 .and_then(|expr| ir::peel::specialize_expression(context, &expr, id, value));
         }

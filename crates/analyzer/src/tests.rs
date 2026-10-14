@@ -24032,6 +24032,45 @@ fn zero_size_from_proto_const_dependent_function() {
 }
 
 #[test]
+fn reset_value_from_iterator_over_proto_const_range() {
+    let code = r#"
+    proto package ProtoA {
+        const N: u32;
+    }
+    package PackageA for ProtoA {
+        const N: u32 = 4;
+    }
+    module ModuleA::<CFG: ProtoA> (
+        clk: input clock,
+        rst: input reset,
+    ) {
+        var q: logic<8> [CFG::N];
+        always_ff {
+            if_reset {
+                for i in 0..CFG::N {
+                    q[i] = (32 + i) as 8;
+                }
+            }
+        }
+    }
+    module ModuleB (
+        clk: input clock,
+        rst: input reset,
+    ) {
+        inst u: ModuleA::<PackageA> (clk, rst);
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::UnevaluableValue { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn non_zero_size_is_allowed() {
     // https://github.com/veryl-lang/veryl/issues/3347
     let code = r#"

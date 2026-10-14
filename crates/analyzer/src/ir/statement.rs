@@ -112,6 +112,14 @@ impl ForRange {
         (start, end)
     }
 
+    pub fn has_const_bounds(&self) -> bool {
+        let (start, end) = self.bounds();
+        [start, end].into_iter().all(|bound| match bound {
+            ForBound::Const(..) => true,
+            ForBound::Expression(x) => x.comptime().is_const,
+        })
+    }
+
     pub fn bounds_mut(&mut self) -> (&mut ForBound, &mut ForBound) {
         let (ForRange::Forward { start, end, .. }
         | ForRange::Reverse { start, end, .. }
