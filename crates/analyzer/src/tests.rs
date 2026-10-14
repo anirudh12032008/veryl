@@ -24100,6 +24100,72 @@ fn reset_value_from_iterator_over_proto_const_range() {
 }
 
 #[test]
+fn zero_size_from_unevaluable_assignment_in_function() {
+    let code = r#"
+    proto package ProtoA {
+        const W: u32;
+    }
+    package PackageA for ProtoA {
+        const W: u32 = 2;
+    }
+    package PackageB::<CFG: ProtoA> {
+        function width () -> u32 {
+            var c: u32;
+            c = 0;
+            c = CFG::W;
+            return c;
+        }
+        const N: u32 = width();
+    }
+    module ModuleA::<CFG: ProtoA> (
+        i_a: input  logic [PackageB::<CFG>::N],
+        o_a: output logic [PackageB::<CFG>::N],
+    ) {
+        assign o_a = i_a;
+    }
+    module ModuleB (
+        i_a: input  logic [2],
+        o_a: output logic [2],
+    ) {
+        inst u: ModuleA::<PackageA> (i_a, o_a);
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // Output arguments of a nested call are not written back either.
+    let code = r#"
+    package PackageC {
+        function g (a: input u32, b: output u32) {
+            b = a;
+        }
+        function f () -> u32 {
+            var c: u32;
+            c = 0;
+            g(5, c);
+            return c;
+        }
+        const N: u32 = f();
+    }
+    module ModuleC (
+        i_a: input  logic [PackageC::N],
+        o_a: output logic [PackageC::N],
+    ) {
+        assign o_a = i_a;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::ZeroSize { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn non_zero_size_is_allowed() {
     // https://github.com/veryl-lang/veryl/issues/3347
     let code = r#"

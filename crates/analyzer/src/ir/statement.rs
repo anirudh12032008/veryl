@@ -502,6 +502,11 @@ impl Statement {
             }
             Statement::SystemFunctionCall(_) => ControlFlow::Continue,
             Statement::FunctionCall(x) => {
+                // Output arguments are not written back, so their bindings
+                // would keep their previous values.
+                if !x.outputs.is_empty() {
+                    context.function_indeterminate = true;
+                }
                 x.eval_value(context);
                 ControlFlow::Continue
             }
@@ -1028,9 +1033,10 @@ impl AssignStatement {
                     variable.set_value(&index, value, range);
                 }
             }
-        } else if let Some(value) = self.expr.eval_value(context) {
+        } else {
             // TODO multiple dst
-            if let Some(index) = self.dst[0].index.eval_value(context)
+            let written = if let Some(value) = self.expr.eval_value(context)
+                && let Some(index) = self.dst[0].index.eval_value(context)
                 && let Some((beg, end)) =
                     self.dst[0]
                         .select
@@ -1038,6 +1044,13 @@ impl AssignStatement {
                 && let Some(variable) = context.variable_mut(&self.dst[0].id)
             {
                 variable.set_value(&index, value, Some((beg, end)));
+                true
+            } else {
+                false
+            };
+            // A skipped write leaves the destination at its previous value.
+            if !written {
+                context.function_indeterminate = true;
             }
         }
         // `return expr;` lowers to an assignment to the function's return
