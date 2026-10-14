@@ -1420,47 +1420,46 @@ pub fn eval_type(
     let mut signed = false;
     let mut is_positive = false;
 
-    // The `var_paths` shortcut below turns a constant into a width, which is what
-    // makes `x as W` work -- so a variable position has to be rejected ahead of it.
-    let resolved = if matches!(pos, TypePosition::Variable) {
-        let resolved = context.resolve_path(path.clone());
-        if let Ok(symbol) = symbol_table::resolve(&resolved)
-            && !symbol.found.is_variable_type()
-        {
-            context.insert_error(AnalyzerError::mismatch_type(
-                MismatchTypeKind::SymbolKind {
-                    name: symbol.found.token.to_string(),
-                    expected: "enum, union, struct or typedef".to_string(),
-                    actual: symbol.found.kind.to_kind_name(),
-                },
-                &path.range,
-            ));
-        }
-        Some(resolved)
+    let (resolved, mapped) = context.resolve_path_mapped(path.clone());
+    let var_path = if mapped {
+        resolved.to_var_path()
     } else {
-        None
+        path.to_var_path()
     };
 
-    let non_const_cast = matches!(pos, TypePosition::Cast)
-        && path
-            .to_var_path()
-            .is_some_and(|x| context.var_paths.get(&x).is_some_and(|x| !x.1.is_const));
-    if non_const_cast {
-        let resolved = context.resolve_path(path.clone());
-        if let Ok(symbol) = symbol_table::resolve(&resolved) {
-            context.insert_error(AnalyzerError::mismatch_type(
-                MismatchTypeKind::SymbolKind {
-                    name: symbol.found.token.to_string(),
-                    expected: "enum, union, struct, typedef or integer constant".to_string(),
-                    actual: symbol.found.kind.to_kind_name(),
-                },
-                &path.range,
-            ));
-        }
+    // The `var_paths` shortcut below turns a constant into a width, which is what
+    // makes `x as W` work -- so a variable position has to be rejected ahead of it.
+    if matches!(pos, TypePosition::Variable)
+        && let Ok(symbol) = symbol_table::resolve(&resolved)
+        && !symbol.found.is_variable_type()
+    {
+        context.insert_error(AnalyzerError::mismatch_type(
+            MismatchTypeKind::SymbolKind {
+                name: symbol.found.token.to_string(),
+                expected: "enum, union, struct or typedef".to_string(),
+                actual: symbol.found.kind.to_kind_name(),
+            },
+            &path.range,
+        ));
     }
 
-    let kind = if let Some(x) = path.to_var_path()
-        && let Some(x) = context.var_paths.get(&x)
+    let non_const_cast = matches!(pos, TypePosition::Cast)
+        && var_path
+            .as_ref()
+            .is_some_and(|x| context.var_paths.get(x).is_some_and(|x| !x.1.is_const));
+    if non_const_cast && let Ok(symbol) = symbol_table::resolve(&resolved) {
+        context.insert_error(AnalyzerError::mismatch_type(
+            MismatchTypeKind::SymbolKind {
+                name: symbol.found.token.to_string(),
+                expected: "enum, union, struct, typedef or integer constant".to_string(),
+                actual: symbol.found.kind.to_kind_name(),
+            },
+            &path.range,
+        ));
+    }
+
+    let kind = if let Some(x) = &var_path
+        && let Some(x) = context.var_paths.get(x)
     {
         match &x.1.value {
             ValueVariant::Type(x) => {
@@ -1496,7 +1495,7 @@ pub fn eval_type(
             _ => ir::TypeKind::Unknown,
         }
     } else {
-        let mut path = resolved.unwrap_or_else(|| context.resolve_path(path.clone()));
+        let mut path = resolved;
         // Before unaliasing: a declared alias is not a generic reference here.
         check_generic_refereence(context, &path);
 
@@ -2678,7 +2677,7 @@ fn eval_factor_path_inner(
 ) -> IrResult<ir::Factor> {
     let (path, select, _) = var_path.into();
 
-    let mut generic_path = context.resolve_path(symbol_path);
+    let (mut generic_path, mapped) = context.resolve_path_mapped(symbol_path);
     // Before unaliasing: a declared alias is not a generic reference here.
     check_generic_refereence(context, &generic_path);
     generic_path.unalias(None);
@@ -2695,6 +2694,8 @@ fn eval_factor_path_inner(
         && let Some((var_id, comptime)) = context.find_path(&path)
     {
         Some((var_id, comptime))
+    } else if mapped {
+        None
     } else {
         context.find_path(&path)
     };
