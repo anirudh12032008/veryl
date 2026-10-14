@@ -7152,6 +7152,32 @@ fn duplicate_enum_variant() {
 }
 
 #[test]
+fn struct_array_param_member_reference() {
+    let code = r#"
+    package PackageA {
+        struct Region {
+            base: logic<32>,
+        }
+    }
+    module ModuleA #(
+        param N: u32                  = 2,
+        param W: PackageA::Region [N] = '{0, 0},
+        param X: PackageA::Region [N] = '{
+            PackageA::Region'{ base: 1 },
+            PackageA::Region'{ base: 2 }
+        },
+    ) (
+        o: output logic,
+    ) {
+        assign o = W[0].base == X[1].base;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty());
+}
+
+#[test]
 fn invisible_identifier() {
     let code = r#"
     package Pkg::<A: u32> {}

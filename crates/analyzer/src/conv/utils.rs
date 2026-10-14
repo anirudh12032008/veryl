@@ -1029,7 +1029,21 @@ fn insert_const_variable(
     comptime: Comptime,
     values: Vec<Value>,
 ) {
+    let token = comptime.token;
     let id = context.insert_var_path(dst.path.clone(), comptime);
+
+    // Without member paths, `X[i].member` falls back to the symbol route, which
+    // re-evaluates the declared type outside the component and loses its
+    // earlier parameters.
+    for x in r#type.expand_struct_union(&dst.path, &[], None) {
+        let r#type = x.part_select.last().unwrap().r#type.clone();
+        let mut comptime = Comptime::from_type(r#type, ClockDomain::None, token);
+        comptime.is_const = true;
+        let path = x.path.clone();
+        comptime.part_select = Some(x);
+        context.insert_var_path_with_id(path, id, comptime);
+    }
+
     let array_limit = context.config.evaluate_array_limit;
     let variable = Variable::new(
         id,

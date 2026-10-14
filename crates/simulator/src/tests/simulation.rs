@@ -37975,3 +37975,42 @@ fn a_field_write_after_a_runtime_index_write_to_its_element_merges_with_it() {
         );
     }
 }
+
+#[test]
+fn struct_member_of_param_array_sized_by_earlier_param() {
+    let code = r#"
+    package pk {
+        struct Region {
+            base: logic<32>,
+            mask: logic<8> ,
+        }
+    }
+    module Top #(
+        param N: u32            = 2,
+        param W: pk::Region [N] = '{
+            pk::Region'{ base: 32'h11, mask: 8'h22 },
+            pk::Region'{ base: 32'h33, mask: 8'h44 }
+        },
+    ) (
+        i: input  logic    ,
+        o: output logic<32>,
+        m: output logic<8> ,
+    ) {
+        assign o = W[i].base;
+        assign m = W[1].mask;
+    }
+    "#;
+
+    for config in Config::all() {
+        dbg!(&config);
+
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        for (i, exp) in [(0, 0x11), (1, 0x33)] {
+            sim.set("i", Value::new(i, 1, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            assert_eq!(sim.get("o").unwrap(), Value::new(exp, 32, false));
+            assert_eq!(sim.get("m").unwrap(), Value::new(0x44, 8, false));
+        }
+    }
+}
