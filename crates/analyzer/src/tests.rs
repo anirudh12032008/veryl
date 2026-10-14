@@ -8429,6 +8429,35 @@ fn referring_before_definition() {
 }
 
 #[test]
+fn inactive_ifdef_module_is_not_analyzed() {
+    let code = r#"
+    #[ifdef(FOO)]
+    module ModuleA (
+        clk: input  clock,
+        rst: input  reset,
+        i_a: input  logic,
+        o_a: output logic,
+    ) {
+        var q: logic;
+        always_ff {
+            if_reset {
+                q = 0;
+            } else {
+                q = i_a;
+            }
+        }
+        assign o_a = q;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let errors = analyze_with_defines(code, &["FOO"]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn referring_inactive_definition() {
     // The declaration sits before the reference; the guard is what it cannot
     // reach.

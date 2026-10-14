@@ -8196,6 +8196,48 @@ fn interface_parameter_override() {
 }
 
 #[test]
+fn always_ff_under_inactive_ifdef_is_dropped() {
+    let code = r#"
+    module Top (
+        clk: input  clock,
+        rst: input  reset,
+        o  : output logic,
+    ) {
+        #[ifdef(CHK)]
+        {
+            var q: logic;
+            always_ff {
+                if_reset {
+                    q = 0;
+                } else {
+                    q = 1;
+                }
+            }
+            assign o = q;
+        }
+        #[ifndef(CHK)]
+        assign o = 0;
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        let clk = sim.get_clock("clk").unwrap();
+        let rst = sim.get_reset("rst").unwrap();
+
+        sim.step_reset(&clk, &rst);
+        sim.step(&clk);
+        assert_eq!(
+            sim.get("o").unwrap(),
+            Value::new(0, 1, false),
+            "config={config:?}"
+        );
+    }
+}
+
+#[test]
 fn a_parameter_typed_by_another_parameter_takes_the_override() {
     // Regression: a parameter whose declared width names another parameter was
     // sized with that parameter's DEFAULT, so `#(W: 5, V: 16)` on
