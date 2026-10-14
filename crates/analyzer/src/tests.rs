@@ -137,6 +137,7 @@ fn analyze_with_defines(code: &str, defines: &[&str]) -> Vec<AnalyzerError> {
         .iter()
         .map(|x| resource_table::insert_str(x))
         .collect();
+    symbol_table::set_defines(&context.config.defines);
     let mut ir = Ir::default();
 
     let mut errors = vec![];
@@ -23346,6 +23347,60 @@ fn concatenation_assignment_contributes_function_effects() {
             .iter()
             .any(|x| matches!(x, AnalyzerError::FunctionOutputInAlwaysFf { .. }))
     );
+}
+
+#[test]
+fn ifdef_package_function_resolves_to_active_variant() {
+    let code = r#"
+    package PackageA {
+        #[ifdef(FEATURE)]
+        function f () -> logic<8> {
+            return 1;
+        }
+        #[else]
+        function f () -> logic<8> {
+            return 2;
+        }
+    }
+    module ModuleA (
+        o: output logic<8>,
+    ) {
+        assign o = PackageA::f();
+    }
+    "#;
+
+    let errors = analyze_with_defines(code, &[]);
+    assert!(errors.is_empty());
+
+    let errors = analyze_with_defines(code, &["FEATURE"]);
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn ifdef_struct_member_resolves_to_active_variant_before_pass2() {
+    // `s.b` is resolved when references are applied after pass1.
+    let code = r#"
+    package PackageA {
+        #[ifdef(FEATURE)]
+        struct S {
+            b: logic<8>,
+        }
+        #[else]
+        struct S {
+            a: logic<8>,
+        }
+    }
+    module ModuleA (
+        o: output logic<8>,
+    ) {
+        var s: PackageA::S;
+        assign s.b = 1;
+        assign o   = s.b;
+    }
+    "#;
+
+    let errors = analyze_with_defines(code, &["FEATURE"]);
+    assert!(errors.is_empty());
 }
 
 #[test]
