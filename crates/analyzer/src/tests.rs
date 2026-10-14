@@ -5831,6 +5831,111 @@ fn array_slice_shape_mismatch() {
 }
 
 #[test]
+fn mismatch_function_arg_struct_type() {
+    let code = r#"
+    package PackageA {
+        struct StructA {
+            x: logic<8>,
+            y: logic<4>,
+        }
+        struct StructB {
+            x: logic<8>,
+        }
+        type AliasB = StructB;
+        function FuncA (
+            b: input StructB,
+        ) -> logic {
+            return b.x[0];
+        }
+        function FuncB (
+            a: input  StructA,
+            b: output StructB,
+        ) {
+            b = a.x as StructB;
+        }
+    }
+    module ModuleA (
+        i_a: input  PackageA::StructA,
+        o_x: output logic,
+    ) {
+        assign o_x = PackageA::FuncA(i_a);
+    }
+    module ModuleB (
+        i_a: input  PackageA::StructA,
+        o_a: output PackageA::StructA,
+    ) {
+        always_comb {
+            PackageA::FuncB(i_a, o_a);
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, AnalyzerError::MismatchAssignment { .. })),
+        "{errors:?}"
+    );
+
+    // The same struct, through an alias, a member, a plain logic value or a
+    // generic package, still binds.
+    let code = r#"
+    package PackageA::<W: u32> {
+        struct StructB {
+            x: logic<W>,
+        }
+        type AliasB = StructB;
+        struct StructA {
+            b: StructB,
+            y: logic<4>,
+        }
+        function FuncA (
+            b: input AliasB,
+        ) -> logic {
+            return b.x[0];
+        }
+        function FuncB (
+            b: output StructB,
+        ) {
+            b = 0;
+        }
+    }
+    module ModuleA::<W: u32> (
+        i_a: input  PackageA::<W>::StructA,
+        i_b: input  PackageA::<W>::StructB,
+        i_l: input  logic<W>,
+        o_x: output logic<4>,
+        o_b: output PackageA::<W>::AliasB,
+    ) {
+        var s: PackageA::<W>::StructA;
+        always_comb {
+            s      = i_a;
+            o_x[0] = PackageA::<W>::FuncA(i_a.b);
+            o_x[1] = PackageA::<W>::FuncA(i_b);
+            o_x[2] = PackageA::<W>::FuncA(i_l);
+            o_x[3] = PackageA::<W>::FuncA(i_a.b as PackageA::<W>::StructB);
+            PackageA::<W>::FuncB(o_b);
+            PackageA::<W>::FuncB(s.b);
+        }
+    }
+    module ModuleB (
+        i_a: input  PackageA::<8>::StructA,
+        i_b: input  PackageA::<8>::StructB,
+        i_l: input  logic<8>,
+        o_x: output logic<4>,
+        o_b: output PackageA::<8>::StructB,
+    ) {
+        inst u: ModuleA::<8> (i_a, i_b, i_l, o_x, o_b);
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn mismatch_assignment() {
     // The unpacked dimensions disagree. No SystemVerilog tool accepts that, so
     // the help says which axis is wrong, but the severity stays the warning the
