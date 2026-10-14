@@ -3257,6 +3257,131 @@ pub(crate) fn array_slice_elements(
     Ok(Some(elements))
 }
 
+/// `$clog2(x)` and `$onehot(x)` of an argument known only at run time, as a
+/// balanced sum of per-bit terms over a single read of the argument, so a wide
+/// argument neither repeats its side effects nor builds a deep expression.
+/// `$clog2` counts the powers of two below `x`, so an x/z bit makes the sum
+/// all x; `$onehot` counts only the bits that are 1 (IEEE 1800-2023 20.9).
+fn lower_runtime_system_function(
+    context: &mut Context,
+    call: &air::SystemFunctionCall,
+    input: &air::Expression,
+) -> Result<ProtoExpression, SimulatorError> {
+    let unsupported = || SimulatorError::unsupported_description(&call.comptime.token);
+    let arg_width = input
+        .comptime()
+        .r#type
+        .total_width()
+        .filter(|&w| w > 0)
+        .ok_or_else(unsupported)?;
+    let unsigned = |width| ExpressionContext {
+        width,
+        signed: false,
+    };
+    let arg: ProtoExpression = Conv::conv(context, input)?;
+    let (var_offset, var_full_width) = match arg {
+        ProtoExpression::Variable {
+            var_offset,
+            select: None,
+            dynamic_select: None,
+            width,
+            var_full_width,
+            ..
+        } if width == arg_width => (var_offset, var_full_width),
+        arg => {
+            let arg = resize_to_width(arg, arg_width, unsigned(arg_width));
+            match snapshot_expression(context, arg) {
+                ProtoExpression::Variable { var_offset, .. } => (var_offset, arg_width),
+                _ => unreachable!(),
+            }
+        }
+    };
+    let bit = |i: usize| ProtoExpression::Variable {
+        var_offset,
+        select: Some((i, i)),
+        dynamic_select: None,
+        width: 1,
+        var_full_width,
+        expr_context: unsigned(1),
+    };
+    let whole = || ProtoExpression::Variable {
+        var_offset,
+        select: None,
+        dynamic_select: None,
+        width: arg_width,
+        var_full_width,
+        expr_context: unsigned(arg_width),
+    };
+    let value = |payload: BigUint, width: usize| ProtoExpression::Value {
+        value: Value::new_biguint(payload, width, false),
+        width,
+        expr_context: unsigned(width),
+    };
+    let binary = |x, op, y, expr_context: ExpressionContext| ProtoExpression::Binary {
+        x: Box::new(x),
+        op,
+        y: Box::new(y),
+        width: expr_context.width,
+        expr_context,
+    };
+    let count = ExpressionContext {
+        width: 32,
+        signed: true,
+    };
+    let terms: Vec<ProtoExpression> = match &call.kind {
+        air::SystemFunctionKind::Clog2(_) => (0..arg_width)
+            .map(|k| {
+                let above = value(BigUint::one() << k, arg_width);
+                binary(whole(), Op::Greater, above, unsigned(1))
+            })
+            .collect(),
+        air::SystemFunctionKind::Onehot(_) if context.config.use_4state => (0..arg_width)
+            .map(|i| binary(value(BigUint::ZERO, 1), Op::NeWildcard, bit(i), unsigned(1)))
+            .collect(),
+        air::SystemFunctionKind::Onehot(_) => (0..arg_width).map(bit).collect(),
+        _ => return Err(unsupported()),
+    };
+    let mut sums: Vec<ProtoExpression> = terms
+        .into_iter()
+        .map(|term| resize_to_width(term, 32, count))
+        .collect();
+    while sums.len() > 1 {
+        let mut next = Vec::with_capacity(sums.len().div_ceil(2));
+        let mut it = sums.into_iter();
+        while let Some(x) = it.next() {
+            next.push(match it.next() {
+                Some(y) => binary(x, Op::Add, y, count),
+                None => x,
+            });
+        }
+        sums = next;
+    }
+    let sum = sums.pop().unwrap();
+    let expr_context: ExpressionContext = (&call.comptime.expr_context).into();
+    Ok(match call.kind {
+        air::SystemFunctionKind::Clog2(_) => ProtoExpression::Resize {
+            x: Box::new(sum),
+            width: 32,
+            sign_extend: true,
+            expr_context,
+        },
+        _ => {
+            let one = ProtoExpression::Value {
+                value: Value::new(1, 32, true),
+                width: 32,
+                expr_context: count,
+            };
+            let onehot = binary(sum, Op::Eq, one, unsigned(1));
+            ProtoExpression::Resize {
+                x: Box::new(onehot),
+                width: 1,
+                sign_extend: false,
+                expr_context,
+            }
+        }
+    })
+}
+
 impl Conv<&air::Expression> for ProtoExpression {
     fn conv(context: &mut Context, src: &air::Expression) -> Result<Self, SimulatorError> {
         match src {
@@ -3548,6 +3673,16 @@ impl Conv<&air::Expression> for ProtoExpression {
                     // `veryl build` and Verilator all accept. Evaluate it,
                     // and report an unsupported description rather than
                     // panicking when it will not evaluate.
+                    //
+                    // A function body is shared by every caller, so an
+                    // argument constant at only some call sites is a runtime
+                    // value here; evaluating it would read a stale binding.
+                    air::SystemFunctionKind::Clog2(input)
+                    | air::SystemFunctionKind::Onehot(input)
+                        if !input.0.comptime().is_const =>
+                    {
+                        lower_runtime_system_function(context, call, &input.0)
+                    }
                     _ => {
                         let scope = context.scope();
                         let value = call.eval_value(&mut scope.analyzer_context);

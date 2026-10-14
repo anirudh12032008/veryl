@@ -38211,3 +38211,234 @@ fn ifdef_package_items_follow_defines() {
         }
     }
 }
+
+#[test]
+fn system_function_with_runtime_argument_in_function() {
+    let code = r#"
+    package Pkg {
+        function w (n: input u32) -> u32 {
+            return $clog2(n);
+        }
+    }
+
+    module Top (
+        a : input  u32     ,
+        b : input  u64     ,
+        c : input  logic<8>,
+        o0: output u32     ,
+        o1: output u32     ,
+        o2: output u32     ,
+        o3: output logic   ,
+        o4: output u32     ,
+        o5: output logic<8>,
+    ) {
+        function wide (n: input u64) -> u32 {
+            return $clog2(n);
+        }
+
+        function one (x: input logic<8>) -> logic {
+            return $onehot(x);
+        }
+
+        function width (x: input logic<8>) -> u32 {
+            return $bits(x) + $size(x);
+        }
+
+        function pick (x: input logic<8>) -> logic<8> {
+            var r: logic<8> [8];
+            r = '{default: 0};
+            let k: u32 = Pkg::w(5);
+            r[k] = x;
+            return r[3];
+        }
+
+        assign o0 = Pkg::w(a);
+        assign o1 = Pkg::w(7);
+        assign o2 = wide(b);
+        assign o3 = one(c);
+        assign o4 = width(c);
+        assign o5 = pick(c);
+    }
+    "#;
+
+    let clog2 = |n: u64| {
+        if n <= 1 {
+            0
+        } else {
+            64 - (n - 1).leading_zeros() as u64
+        }
+    };
+
+    for config in Config::all() {
+        dbg!(&config);
+
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        for (a, b, c) in [
+            (0u64, 0u64, 0u64),
+            (1, 1, 1),
+            (2, 2, 4),
+            (5, 1 << 40, 6),
+            (1 << 31, (1 << 40) + 1, 128),
+            (u32::MAX as u64, u64::MAX, 255),
+        ] {
+            sim.set("a", Value::new(a, 32, false));
+            sim.set("b", Value::new(b, 64, false));
+            sim.set("c", Value::new(c, 8, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+
+            assert_eq!(sim.get("o0").unwrap(), Value::new(clog2(a), 32, false));
+            assert_eq!(sim.get("o1").unwrap(), Value::new(3, 32, false));
+            assert_eq!(sim.get("o2").unwrap(), Value::new(clog2(b), 32, false));
+            let onehot = (c.count_ones() == 1) as u64;
+            assert_eq!(sim.get("o3").unwrap(), Value::new(onehot, 1, false));
+            assert_eq!(sim.get("o4").unwrap(), Value::new(16, 32, false));
+            assert_eq!(sim.get("o5").unwrap(), Value::new(c, 8, false));
+        }
+    }
+}
+
+#[test]
+fn system_function_with_runtime_argument_evaluates_it_once() {
+    let code = r#"
+    module Top (
+        o0: output u32     ,
+        c0: output logic<4>,
+        o1: output logic   ,
+        c1: output logic<4>,
+    ) {
+        var cnt: logic<4>;
+
+        function next () -> logic<4> {
+            cnt += 1;
+            return cnt;
+        }
+
+        function clog2_next () -> u32 {
+            return $clog2(next());
+        }
+
+        function onehot_next () -> logic {
+            return $onehot(next());
+        }
+
+        always_comb {
+            cnt = 1;
+            o0  = clog2_next();
+            c0  = cnt;
+            cnt = 1;
+            o1  = onehot_next();
+            c1  = cnt;
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let mut sim = Simulator::new(analyze(code, &config), None);
+        sim.step(&Event::clock(VarId::SYNTHETIC));
+        assert_eq!(
+            sim.get("o0").unwrap(),
+            Value::new(1, 32, false),
+            "{config:?}"
+        );
+        assert_eq!(
+            sim.get("c0").unwrap(),
+            Value::new(2, 4, false),
+            "{config:?}"
+        );
+        assert_eq!(
+            sim.get("o1").unwrap(),
+            Value::new(1, 1, false),
+            "{config:?}"
+        );
+        assert_eq!(
+            sim.get("c1").unwrap(),
+            Value::new(2, 4, false),
+            "{config:?}"
+        );
+    }
+}
+
+#[test]
+fn system_function_with_runtime_argument_keeps_signed_clog2() {
+    let code = r#"
+    module Top (
+        a: input  u32  ,
+        o: output logic,
+    ) {
+        function negative (x: input u32) -> logic {
+            return $clog2(x) <: -1;
+        }
+
+        assign o = negative(a);
+    }
+    "#;
+
+    for config in Config::all() {
+        let mut sim = Simulator::new(analyze(code, &config), None);
+        for a in [0, 1, 8, u32::MAX as u64] {
+            sim.set("a", Value::new(a, 32, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            assert_eq!(sim.get("o").unwrap(), Value::new(0, 1, false), "{config:?}");
+        }
+    }
+}
+
+#[test]
+fn system_function_with_runtime_argument_follows_four_state_rules() {
+    let code = r#"
+    module Top (
+        a : input  logic<4>,
+        o0: output u32     ,
+        o1: output logic   ,
+    ) {
+        function c (x: input logic<4>) -> u32 {
+            return $clog2(x);
+        }
+
+        function h (x: input logic<4>) -> logic {
+            return $onehot(x);
+        }
+
+        assign o0 = c(a);
+        assign o1 = h(a);
+    }
+    "#;
+
+    for config in Config::all().into_iter().filter(|c| c.use_4state) {
+        let mut sim = Simulator::new(analyze(code, &config), None);
+        // (payload, x/z mask, $onehot): $clog2 is all x whenever a bit is.
+        for (payload, mask, onehot) in [
+            (0b1001, 0b0100, 0),
+            (0b0001, 0b0100, 1),
+            (0b0000, 0b0100, 0),
+            (0b0000, 0b1111, 0),
+        ] {
+            sim.set("a", Value::from_u128(payload, mask, 4, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            assert_eq!(
+                sim.get("o0").unwrap(),
+                Value::from_u128(0, 0xffff_ffff, 32, false),
+                "{config:?} {payload:#b}/{mask:#b}"
+            );
+            assert_eq!(
+                sim.get("o1").unwrap(),
+                Value::new(onehot, 1, false),
+                "{config:?} {payload:#b}/{mask:#b}"
+            );
+        }
+        sim.set("a", Value::new(0b0100, 4, false));
+        sim.step(&Event::clock(VarId::SYNTHETIC));
+        assert_eq!(
+            sim.get("o0").unwrap(),
+            Value::new(2, 32, false),
+            "{config:?}"
+        );
+        assert_eq!(
+            sim.get("o1").unwrap(),
+            Value::new(1, 1, false),
+            "{config:?}"
+        );
+    }
+}
