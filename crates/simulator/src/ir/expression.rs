@@ -3533,6 +3533,22 @@ impl Conv<&air::Expression> for ProtoExpression {
                     if let Some(idx_vals) = const_index {
                         let scope = context.scope();
                         let meta = scope.variable_meta.get(id).unwrap();
+                        // A constant index past the end can sit in an arm that
+                        // is never taken, e.g. `if i + 1 <: N ? a[i + 1] : 0`
+                        // in an unrolled loop; it reads like a dynamic one.
+                        let out_of_range = meta
+                            .r#type
+                            .array
+                            .iter()
+                            .zip(&idx_vals)
+                            .any(|(dim, i)| dim.is_some_and(|dim| *i >= dim));
+                        if out_of_range {
+                            return Ok(ProtoExpression::Value {
+                                value: out_of_range_read(width, expr_context.signed, use_4state),
+                                width,
+                                expr_context,
+                            });
+                        }
                         let index = meta.r#type.array.calc_index(&idx_vals).ok_or_else(|| {
                             SimulatorError::unsupported_description(&comptime.token)
                         })?;

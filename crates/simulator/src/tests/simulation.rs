@@ -38501,3 +38501,46 @@ fn system_function_with_runtime_argument_follows_four_state_rules() {
         );
     }
 }
+
+#[test]
+fn constant_index_past_end_in_untaken_arm() {
+    let code = r#"
+    module Top (
+        x : input  logic<8>,
+        w2: output logic<16>,
+        w3: output logic<16>,
+    ) {
+        const N: u32 = 4;
+        var a: logic<8>  [N];
+        var w: logic<16> [N];
+        always_comb {
+            for h in 0..N {
+                a[h] = x + h;
+            }
+            for h in 0..N {
+                w[h] = {if h + 1 <: N ? a[h + 1] : 8'd0, a[h]};
+            }
+        }
+        assign w2 = w[2];
+        assign w3 = w[3];
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        sim.set("x", Value::new(0x10, 8, false));
+        sim.step(&Event::clock(VarId::SYNTHETIC));
+        assert_eq!(
+            sim.get("w2").unwrap(),
+            Value::new(0x1312, 16, false),
+            "config={config:?}"
+        );
+        assert_eq!(
+            sim.get("w3").unwrap(),
+            Value::new(0x0013, 16, false),
+            "config={config:?}"
+        );
+    }
+}
