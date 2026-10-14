@@ -6513,6 +6513,65 @@ fn function_call_with_output() {
 }
 
 #[test]
+fn function_call_with_array_output() {
+    let code = r#"
+    module Top (
+        a   : input  logic<4>,
+        o0  : output logic<4>,
+        o1  : output logic<4>,
+        o2  : output logic<4>,
+        o3  : output logic<4>,
+        q0  : output logic<4>,
+        q1  : output logic<4>,
+    ) {
+        function split (
+            x: input  logic<4>    ,
+            c: output logic<4> [2],
+        ) {
+            c[0] = x;
+            c[1] = ~x;
+        }
+
+        var w: logic<4> [2, 2];
+        var r: logic<4> [2];
+
+        always_comb {
+            split(a, w[0]);
+            split(a + 4'd1, w[1]);
+        }
+
+        always_comb {
+            split(a - 4'd1, r);
+        }
+
+        assign o0 = w[0][0];
+        assign o1 = w[0][1];
+        assign o2 = w[1][0];
+        assign o3 = w[1][1];
+        assign q0 = r[0];
+        assign q1 = r[1];
+    }
+    "#;
+
+    for config in Config::all() {
+        dbg!(&config);
+
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        sim.set("a", Value::new(5, 4, false));
+        sim.step(&Event::clock(VarId::SYNTHETIC));
+
+        assert_eq!(sim.get("o0").unwrap(), Value::new(5, 4, false));
+        assert_eq!(sim.get("o1").unwrap(), Value::new(10, 4, false));
+        assert_eq!(sim.get("o2").unwrap(), Value::new(6, 4, false));
+        assert_eq!(sim.get("o3").unwrap(), Value::new(9, 4, false));
+        assert_eq!(sim.get("q0").unwrap(), Value::new(4, 4, false));
+        assert_eq!(sim.get("q1").unwrap(), Value::new(11, 4, false));
+    }
+}
+
+#[test]
 fn function_call_nested() {
     let code = r#"
     module Top (

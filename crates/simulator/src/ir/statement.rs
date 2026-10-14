@@ -5629,25 +5629,18 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
         for (var_path, destinations) in &src.outputs {
             let arg_var_id = body.arg_map.get(var_path).unwrap();
             let scope = context.scope();
-            let arg_meta = scope.variable_meta.get(arg_var_id).unwrap();
-            let arg_element = &arg_meta.elements[0];
-            let arg_expr = ProtoExpression::Variable {
-                var_offset: arg_element.current,
-                select: None,
-                dynamic_select: None,
-                width: arg_meta.width,
-                var_full_width: arg_meta.width,
-                expr_context: ExpressionContext {
-                    width: arg_meta.width,
-                    signed: false,
-                },
-            };
+            let arg_meta = scope.variable_meta.get(arg_var_id).unwrap().clone();
             for dst in destinations {
                 let scope = context.scope();
                 let dst_meta = scope.variable_meta.get(&dst.id).unwrap();
-                let dst_index = dst.index.eval_value(&mut scope.analyzer_context).unwrap();
-                let dst_index = dst_meta.r#type.array.calc_index(&dst_index).unwrap();
-                let dst_element = &dst_meta.elements[dst_index];
+                // An array output binds a whole array or a constant partial
+                // index (`o` / `o[i]`).
+                let (first, last) = dst
+                    .index
+                    .eval_value(&mut scope.analyzer_context)
+                    .and_then(|x| dst_meta.r#type.array.calc_range(&x))
+                    .filter(|(beg, end)| end - beg + 1 == arg_meta.elements.len())
+                    .ok_or_else(|| SimulatorError::unsupported_description(&dst.token))?;
 
                 let select = if !dst.select.is_empty() {
                     dst.select
@@ -5656,38 +5649,37 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
                     None
                 };
 
-                // Same slot choice as an assignment statement: a
-                // combinational write into FF storage has no NBA delay, so a
-                // later read in the same block (a loop's `break` test) sees it.
-                let is_ff = dst_element.is_ff();
-                let current_offset = dst_element.current_offset();
-                let next_offset = dst_element.next_offset;
-                let comb_direct = is_ff && in_comb && !in_initial;
-                let dst_var = if !is_ff {
-                    VarOffset::Comb(current_offset)
-                } else if in_initial || comb_direct {
-                    VarOffset::Ff(current_offset)
-                } else {
-                    VarOffset::Ff(next_offset)
-                };
+                for (arg_element, dst_index) in arg_meta.elements.iter().zip(first..=last) {
+                    let dst_element = &dst_meta.elements[dst_index];
+                    let arg_expr = ProtoExpression::Variable {
+                        var_offset: arg_element.current,
+                        select: None,
+                        dynamic_select: None,
+                        width: arg_meta.width,
+                        var_full_width: arg_meta.width,
+                        expr_context: ExpressionContext {
+                            width: arg_meta.width,
+                            signed: false,
+                        },
+                    };
 
-                result.push(ProtoStatement::Assign(ProtoAssignStatement {
-                    dst: dst_var,
-                    dst_width: dst_meta.width,
-                    select,
-                    dynamic_select: None,
-                    rhs_select: None,
-                    expr: arg_expr.clone(),
-                    dst_ff_current_offset: current_offset,
-                    comb_direct,
-                    token: TokenRange::default(),
-                }));
-                // As for an assignment, the next slot gets the value too: an
-                // `always_ff` read-modify-write reads it, and an initial value
-                // must survive the swap.
-                if (comb_direct || in_initial) && is_ff && next_offset != current_offset {
+                    // Same slot choice as an assignment statement: a
+                    // combinational write into FF storage has no NBA delay, so a
+                    // later read in the same block (a loop's `break` test) sees it.
+                    let is_ff = dst_element.is_ff();
+                    let current_offset = dst_element.current_offset();
+                    let next_offset = dst_element.next_offset;
+                    let comb_direct = is_ff && in_comb && !in_initial;
+                    let dst_var = if !is_ff {
+                        VarOffset::Comb(current_offset)
+                    } else if in_initial || comb_direct {
+                        VarOffset::Ff(current_offset)
+                    } else {
+                        VarOffset::Ff(next_offset)
+                    };
+
                     result.push(ProtoStatement::Assign(ProtoAssignStatement {
-                        dst: VarOffset::Ff(next_offset),
+                        dst: dst_var,
                         dst_width: dst_meta.width,
                         select,
                         dynamic_select: None,
@@ -5697,6 +5689,22 @@ impl Conv<&FunctionCall> for Vec<ProtoStatement> {
                         comb_direct,
                         token: TokenRange::default(),
                     }));
+                    // As for an assignment, the next slot gets the value too: an
+                    // `always_ff` read-modify-write reads it, and an initial value
+                    // must survive the swap.
+                    if (comb_direct || in_initial) && is_ff && next_offset != current_offset {
+                        result.push(ProtoStatement::Assign(ProtoAssignStatement {
+                            dst: VarOffset::Ff(next_offset),
+                            dst_width: dst_meta.width,
+                            select,
+                            dynamic_select: None,
+                            rhs_select: None,
+                            expr: arg_expr.clone(),
+                            dst_ff_current_offset: current_offset,
+                            comb_direct,
+                            token: TokenRange::default(),
+                        }));
+                    }
                 }
             }
         }
