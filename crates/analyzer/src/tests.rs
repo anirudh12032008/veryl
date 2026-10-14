@@ -4492,6 +4492,47 @@ fn incompat_proto() {
 
     let errors = analyze(code);
     assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
+
+    // A type named through an import is the same type as its qualified name.
+    let code = r#"
+    package TypePkg {
+        type T = logic<4>;
+        type U = logic<4>;
+    }
+    proto package ProtoPkg {
+        const A: TypePkg::T;
+        type B = TypePkg::T;
+        function f (a: input TypePkg::T) -> TypePkg::T;
+    }
+    package Pkg for ProtoPkg {
+        import TypePkg::*;
+        const A: T = 4'd3;
+        type B = T;
+        function f (a: input T) -> T {
+            return a;
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let code = r#"
+    package TypePkg {
+        type T = logic<4>;
+        type U = logic<4>;
+    }
+    proto package ProtoPkg {
+        const A: TypePkg::T;
+    }
+    package Pkg for ProtoPkg {
+        import TypePkg::*;
+        const A: U = 4'd3;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
 }
 
 #[test]
