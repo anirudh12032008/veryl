@@ -10318,10 +10318,6 @@ fn expr_c_type(width: usize) -> Option<&'static str> {
     }
 }
 
-/// Above this many statements a dataflow comb gets no whole-settle entry,
-/// which would repeat every statement.
-const DATAFLOW_COARSE_MAX_STMTS: usize = 20_000;
-
 /// The comb offsets each unit may keep in locals, with their widths: written
 /// in the unit and read nowhere else.
 fn local_sets_of(units: &[&[&ProtoStatement]]) -> Vec<HashSet<(isize, usize)>> {
@@ -10391,16 +10387,11 @@ pub fn emit_dataflow_function(
             }
         })
         .collect();
-    // A small comb also gets a whole-settle entry that runs every statement
-    // with no per-cell test, compare or mark, for the runtime to pick when
-    // most cells run anyway.  Its parts cut the cells' concatenated order.
-    let n_stmts: usize = cells.iter().map(|c| c.len()).sum();
-    let coarse = n_stmts <= DATAFLOW_COARSE_MAX_STMTS;
-    let all: Vec<&ProtoStatement> = if coarse {
-        cells.iter().flatten().copied().collect()
-    } else {
-        Vec::new()
-    };
+    // The comb also gets a whole-settle entry that runs every statement with
+    // no per-cell test, compare or mark, for the runtime to pick when most
+    // cells run anyway.  Its parts cut the cells' concatenated order, so no
+    // function grows with the design; only the source doubles.
+    let all: Vec<&ProtoStatement> = cells.iter().flatten().copied().collect();
     let coarse_parts: Vec<&[&ProtoStatement]> = all.chunks(PART_LEN).collect();
     let local_sets = local_sets_of(&parts.iter().map(|p| p.1).collect::<Vec<_>>());
     // A whole-settle part keeps in locals only what a cell's part does too:
@@ -10614,36 +10605,32 @@ pub fn emit_dataflow_function(
     body.push_str(&entry("veryl_aot_eval", ""));
     // A counting copy for the runtime to weigh against the whole-settle
     // entry; only probes take it, as counting costs every call.
-    if coarse {
+    body.push_str(&format!(
+        "static const uint32_t veryl_cell_stmts[{n}] = {{{}}};\n",
+        cells
+            .iter()
+            .map(|c| c.len().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    body.push_str(&entry(
+        "veryl_aot_eval_counted",
+        "\x20           write_log[0] += veryl_cell_stmts[k];\n\
+         \x20           write_log[1]++;\n",
+    ));
+    body.push_str(&format!(
+        "{ENTRY_ATTR}\n\
+         void veryl_aot_eval_coarse(uint8_t *__restrict__ ff_values, uint8_t *__restrict__ comb_values, uint64_t *__restrict__ write_log, intptr_t ff_delta) {{\n\
+         \x20   (void)write_log;\n\
+         \x20   uint64_t *dirty = (uint64_t *)ff_delta;\n"
+    ));
+    for q in 0..coarse_parts.len() {
         body.push_str(&format!(
-            "static const uint32_t veryl_cell_stmts[{n}] = {{{}}};\n",
-            cells
-                .iter()
-                .map(|c| c.len().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        body.push_str(&entry(
-            "veryl_aot_eval_counted",
-            "\x20           write_log[0] += veryl_cell_stmts[k];\n\
-             \x20           write_log[1]++;\n",
+            "    veryl_aot_chunk_{}(ff_values, comb_values, dirty);\n",
+            coarse_base + q
         ));
     }
-    if coarse {
-        body.push_str(&format!(
-            "{ENTRY_ATTR}\n\
-             void veryl_aot_eval_coarse(uint8_t *__restrict__ ff_values, uint8_t *__restrict__ comb_values, uint64_t *__restrict__ write_log, intptr_t ff_delta) {{\n\
-             \x20   (void)write_log;\n\
-             \x20   uint64_t *dirty = (uint64_t *)ff_delta;\n"
-        ));
-        for q in 0..coarse_parts.len() {
-            body.push_str(&format!(
-                "    veryl_aot_chunk_{}(ff_values, comb_values, dirty);\n",
-                coarse_base + q
-            ));
-        }
-        body.push_str("}\n");
-    }
+    body.push_str("}\n");
     Some(body)
 }
 
@@ -11430,6 +11417,41 @@ mod tests {
         assert!(s.contains("comb_values + 0x20"));
         assert!(s.contains("veryl_u32_ua"));
         assert!(s.contains("0xdeadbeefULL"));
+    }
+
+    #[test]
+    fn dataflow_whole_settle_entry_has_no_size_cap() {
+        let stmts: Vec<ProtoStatement> = (0..40_000)
+            .map(|i| {
+                ProtoStatement::Assign(ProtoAssignStatement {
+                    dst: VarOffset::Comb(i * 8),
+                    dst_width: 32,
+                    select: None,
+                    dynamic_select: None,
+                    rhs_select: None,
+                    expr: const_expr(i as u64, 32),
+                    dst_ff_current_offset: 0,
+                    comb_direct: false,
+                    token: dummy_token(),
+                })
+            })
+            .collect();
+        let cells: Vec<Vec<u32>> = (0..stmts.len() as u32)
+            .collect::<Vec<_>>()
+            .chunks(64)
+            .map(|c| c.to_vec())
+            .collect();
+        let n = cells.len();
+        let plan = crate::ir::opt::dataflow::DataflowPlan {
+            cells,
+            boundary: vec![Vec::new(); n],
+            consumers: vec![Vec::new(); n],
+            mark_always: vec![false; n],
+            ..Default::default()
+        };
+        let src = emit_dataflow_function(&stmts, &plan).unwrap();
+        assert!(src.contains("void veryl_aot_eval_coarse("));
+        assert_eq!(src.matches("0x9c3fULL").count(), 2);
     }
 
     #[test]
