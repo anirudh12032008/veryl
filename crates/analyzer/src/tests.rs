@@ -7806,6 +7806,35 @@ fn undefined_identifier() {
 }
 
 #[test]
+fn overridden_param_default_not_evaluated() {
+    let code = r#"
+    module ModuleA #(
+        param N  : u32         = 1      ,
+        param TBL: logic<8> [N] = '{8'd0},
+    ) (
+        o: output logic<8>,
+    ) {
+        assign o = TBL[N - 1];
+    }
+
+    module ModuleB (
+        o: output logic<8>,
+    ) {
+        const T: logic<8> [2] = '{8'd1, 8'd2};
+        inst u: ModuleA #(
+            N  : 2,
+            TBL: T,
+        ) (
+            o,
+        );
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn referring_before_definition() {
     let code = r#"
     module ModuleA {
