@@ -2723,6 +2723,10 @@ impl Conv<&air::InstDeclaration> for ProtoDeclaration {
             }
 
             let mut proto_expr: ProtoExpression = Conv::conv(context, input_expr)?;
+            // A function call in the connection is inlined into pending
+            // statements, which must run before the port is assigned; left
+            // pending, they are flushed into whatever block converts next.
+            all_comb_statements.append(&mut context.pending_statements);
             // No assignment statement here to size the literal.
             size_literal_rhs(&mut proto_expr, None, None, child_meta.width);
             let element = &child_meta.elements[0];

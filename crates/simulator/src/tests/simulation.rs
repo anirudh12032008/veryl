@@ -693,6 +693,65 @@ fn ff_read_as_index_from_other_block() {
 }
 
 #[test]
+fn function_call_in_instance_port_is_not_delayed() {
+    // The inlined call must run before the child port is assigned, not in
+    // the parent's next block (here the always_ff, a cycle late).
+    let code = r#"
+    module Child (
+        clk: input  clock,
+        rst: input  reset,
+        i_x: input  logic,
+        o_q: output logic,
+    ) {
+        always_ff {
+            if_reset {
+                o_q = 0;
+            } else {
+                o_q = i_x;
+            }
+        }
+    }
+    module Top (
+        clk: input  clock,
+        rst: input  reset,
+        q  : output logic,
+        e  : output logic,
+    ) {
+        function is_one (
+            k: input logic<3>,
+        ) -> logic {
+            return k == 3'd1;
+        }
+        var k: logic<3>;
+        inst u: Child (clk, rst, i_x: is_one(k), o_q: q);
+        always_ff {
+            if_reset {
+                k = 0;
+                e = 0;
+            } else {
+                k = k + 3;
+                e = is_one(k);
+            }
+        }
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        let clk = sim.get_clock("clk").unwrap();
+        let rst = sim.get_reset("rst").unwrap();
+
+        sim.step_reset(&clk, &rst);
+        for _ in 0..16 {
+            sim.step(&clk);
+            assert_eq!(sim.get("q"), sim.get("e"), "config={config:?}");
+        }
+    }
+}
+
+#[test]
 fn ff_read_as_system_function_arg_from_other_block() {
     let code = r#"
     module Top (
