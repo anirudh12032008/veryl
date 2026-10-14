@@ -482,9 +482,9 @@ impl Statement {
                             }
                         }
                     }
-                } else if context.comptime_for_overflow.is_none()
-                    && x.range.is_over_size_limit(context)
-                {
+                } else if !x.range.is_over_size_limit(context) {
+                    context.function_indeterminate = true;
+                } else if context.comptime_for_overflow.is_none() {
                     // Over-limit range: skipping the body would fold the const
                     // to its pre-loop value. The eval path swallows errors, so
                     // record it here for analyzer.rs to surface.
@@ -1122,6 +1122,8 @@ impl IfStatement {
                     }
                 }
             }
+        } else {
+            context.function_indeterminate = true;
         }
         ControlFlow::Continue
     }
@@ -1443,6 +1445,7 @@ impl CasePattern {
 impl CaseStatement {
     pub fn eval_value(&self, context: &mut Context) -> ControlFlow {
         let Some(tgt) = self.case_target.eval_value(context) else {
+            context.function_indeterminate = true;
             return ControlFlow::Continue;
         };
         for arm in &self.arms {
@@ -1467,6 +1470,7 @@ impl CaseStatement {
                 return ControlFlow::Continue;
             }
             if undecided {
+                context.function_indeterminate = true;
                 return ControlFlow::Continue;
             }
         }

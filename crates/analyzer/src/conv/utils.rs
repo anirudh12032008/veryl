@@ -287,8 +287,11 @@ fn eval_range_inner(
             &range.into(),
         ));
     }
-    let beg = if beg_comptime.is_const {
-        let value = beg_comptime.get_value()?;
+    // A const bound may still have no value, e.g. a proto package constant
+    // seen from inside a generic; it stays an expression to evaluate later.
+    let beg = if beg_comptime.is_const
+        && let Ok(value) = beg_comptime.get_value()
+    {
         // A strictly negative bound (signed value <= 0, nonzero payload)
         // would wrap through to_usize into a huge unsigned ForBound.
         if value.is_semantically_not_positive() && value.is_positive() {
@@ -314,8 +317,9 @@ fn eval_range_inner(
                 &range.into(),
             ));
         }
-        let end = if end_comptime.is_const {
-            let value = end_comptime.get_value()?;
+        let end = if end_comptime.is_const
+            && let Ok(value) = end_comptime.get_value()
+        {
             if value.is_semantically_not_positive() && value.is_positive() {
                 let token: TokenRange = range.into();
                 context.insert_error(AnalyzerError::invalid_for_range(

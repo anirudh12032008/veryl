@@ -23976,6 +23976,62 @@ fn zero_size() {
 }
 
 #[test]
+fn zero_size_from_proto_const_dependent_function() {
+    // Proto constants have no value inside a generic, so these functions must
+    // not fold to their initial value.
+    let code = r#"
+    proto package ProtoA {
+        const W: u32;
+        const T: u32 [W];
+    }
+    package PackageA for ProtoA {
+        const W: u32     = 2;
+        const T: u32 [W] = '{1, 1};
+    }
+    package PackageB::<CFG: ProtoA> {
+        function count () -> u32 {
+            var c: u32;
+            c = 0;
+            for p in 0..CFG::W {
+                c += CFG::T[p];
+            }
+            return c;
+        }
+        function select () -> u32 {
+            var c: u32;
+            c = 0;
+            if CFG::W == 2 {
+                c = 1;
+            }
+            return c;
+        }
+        const N: u32 = count();
+        const M: u32 = select();
+    }
+    module ModuleA::<CFG: ProtoA> (
+        i_a: input  logic [PackageB::<CFG>::N],
+        o_a: output logic [PackageB::<CFG>::N],
+        i_b: input  logic [PackageB::<CFG>::M],
+        o_b: output logic [PackageB::<CFG>::M],
+    ) {
+        assign o_a = i_a;
+        assign o_b = i_b;
+    }
+    module ModuleB (
+        i_a: input  logic [2],
+        o_a: output logic [2],
+        i_b: input  logic [1],
+        o_b: output logic [1],
+    ) {
+        inst u: ModuleA::<PackageA> (i_a, o_a, i_b, o_b);
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn non_zero_size_is_allowed() {
     // https://github.com/veryl-lang/veryl/issues/3347
     let code = r#"
