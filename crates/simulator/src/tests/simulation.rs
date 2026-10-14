@@ -752,6 +752,53 @@ fn function_call_in_instance_port_is_not_delayed() {
 }
 
 #[test]
+fn function_reassigning_a_local_in_instance_port_through_child_loop() {
+    // The connection reads a child output and feeds a child input, so the
+    // instance's statements are sorted one by one; the inlined body must
+    // still run its reassignments of `z` in order.
+    let code = r#"
+    module Child (
+        i_k: input  logic<4>,
+        o_a: output logic<4>,
+        i_d: input  logic<8>,
+        o_q: output logic<8>,
+    ) {
+        assign o_a = i_k ^ 4'h5;
+        assign o_q = i_d;
+    }
+    module Top (
+        k: input  logic<4>,
+        q: output logic<8>,
+        e: output logic<8>,
+    ) {
+        function g (
+            x: input logic<4>,
+        ) -> logic<8> {
+            var z: logic<8>;
+            z = {x, x} + 8'h15;
+            z = (z ^ (z >> 3)) * 8'h2b;
+            z = (z ^ (z >> 2)) * 8'h4d;
+            return z;
+        }
+        var a: logic<4>;
+        inst u: Child (i_k: k, o_a: a, i_d: g(a), o_q: q);
+        assign e = g(k ^ 4'h5);
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        for k in 0..16 {
+            sim.set("k", Value::new(k, 4, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            assert_eq!(sim.get("q"), sim.get("e"), "k={k} config={config:?}");
+        }
+    }
+}
+
+#[test]
 fn ff_read_as_system_function_arg_from_other_block() {
     let code = r#"
     module Top (
