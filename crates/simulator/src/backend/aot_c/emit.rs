@@ -5372,7 +5372,7 @@ fn compile_source_in(cache_dir: &Path, src: &str) -> Result<EmittedModule, Strin
             // The shell, not us, owns the publish, so its pid is what tells
             // a waiter whether the lock is still live (see `owner_alive`).
             if let Some(lp) = &lock_path {
-                let _ = fs::write(lp, format!("{}\n", child.id()));
+                let _ = fs::write(lp, format!("{}\n", owner_record(child.id())));
             }
             child
                 .wait_with_output()
@@ -5600,10 +5600,11 @@ pub fn detach_pending_compiles() {
         // `exec` keeps the pid written into the lock for the compile.
         let temps: Vec<String> = staged.temps.iter().map(|t| quote(t.as_os_str())).collect();
         let mut body = format!(
-            "rm -f \"$0\"\n[ -e {so} ] && {{ rm -f {t}; exit 0; }}\n( set -C; echo $$ > {lk} ) 2>/dev/null || {{ rm -f {t}; exit 0; }}\nexec /bin/sh -c {}",
+            "rm -f \"$0\"\n[ -e {so} ] && {{ rm -f {t}; exit 0; }}\n( set -C; {rec} > {lk} ) 2>/dev/null || {{ rm -f {t}; exit 0; }}\nexec /bin/sh -c {}",
             quote(staged.script.as_ref()),
             so = quote(so_path.as_os_str()),
             lk = quote(lock_path.as_os_str()),
+            rec = LOCK_RECORD_SH,
             t = temps.join(" "),
         );
         for a in &staged.args {
@@ -5784,18 +5785,60 @@ enum CompileTicket {
 /// taken over at once instead — see [`owner_alive`].
 const COMPILE_LOCK_STALE: Duration = Duration::from_secs(600);
 
+/// A lock file's owner record, `pid pidns starttime`: a pid alone is
+/// ambiguous across pid namespaces and after reuse.  Either extra field is
+/// empty when procfs cannot tell.
+fn owner_record(pid: u32) -> String {
+    let ns = pid_namespace().unwrap_or_default();
+    let start = proc_start_time(pid).unwrap_or_default();
+    format!("{pid} {ns} {start}")
+}
+
+/// This process's pid namespace (`pid:[inode]`), when procfs shows it.
+fn pid_namespace() -> Option<String> {
+    let ns = fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(ns.to_string_lossy().into_owned())
+}
+
+/// Field 22 of `/proc/<pid>/stat`, the start time in clock ticks since boot.
+/// The command name in field 2 may itself hold spaces and parentheses, so the
+/// fields are counted from its closing parenthesis.
+fn proc_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19).map(str::to_string)
+}
+
+/// [`owner_record`] of the running shell, for a lock the shell takes itself.
+#[cfg(unix)]
+const LOCK_RECORD_SH: &str = r#"s=$(cat /proc/$$/stat 2>/dev/null); s=${s##*) }; set -- $s; echo "$$ $(readlink /proc/self/ns/pid 2>/dev/null) ${20}""#;
+
 /// Is the compile shell recorded in a lock file still running?
 ///
 /// The publishing shell outlives us on purpose, so its pid — not ours — is
 /// what makes a lock meaningful.  Without this check a run killed mid-compile
 /// would hold the artifact hostage for [`COMPILE_LOCK_STALE`].
-/// `None` = no pid recorded yet; fall back to the age rule.
+/// `None` = the owner cannot be identified (no pid recorded yet, or one that
+/// procfs cannot vouch for); fall back to the age rule.
 fn owner_alive(lock_path: &Path) -> Option<bool> {
-    let pid: u32 = fs::read_to_string(lock_path).ok()?.trim().parse().ok()?;
+    let text = fs::read_to_string(lock_path).ok()?;
+    let mut fields = text.split_whitespace();
+    let pid: u32 = fields.next()?.parse().ok()?;
     // Linux: procfs is authoritative and free.  Guarded by /proc/self so a
     // system without procfs doesn't read every pid as dead.
     if Path::new("/proc/self").exists() {
-        return Some(Path::new(&format!("/proc/{pid}")).exists());
+        // A pid from another pid namespace names an unrelated process here,
+        // or none; trusting a live-looking one would hold the lock forever.
+        let ns = fields.next()?;
+        if pid_namespace().as_deref() != Some(ns) {
+            return None;
+        }
+        let Some(now) = proc_start_time(pid) else {
+            return Some(false);
+        };
+        // A different start time is a reused pid; none recorded leaves the
+        // pid's existence as the only evidence.
+        return Some(fields.next().is_none_or(|start| start == now));
     }
     // Other unix: `kill -0` through the shell we already use, so this needs
     // no libc dependency.
@@ -13013,6 +13056,50 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn compile_lock_owner_from_another_pid_namespace_ages_out() {
+        // Only a record procfs can vouch for decides; anything else falls
+        // back to the age rule.
+        if pid_namespace().is_none() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("veryl_aot_lockns_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let lock = tmp.join("veryl_aot_cafe.lock");
+        let me = std::process::id();
+        let ns = pid_namespace().unwrap();
+        let start = proc_start_time(me).unwrap();
+
+        fs::write(&lock, owner_record(me)).unwrap();
+        assert_eq!(owner_alive(&lock), Some(true));
+        // A reused pid: same namespace, different start time.
+        fs::write(&lock, format!("{me} {ns} {start}0")).unwrap();
+        assert_eq!(owner_alive(&lock), Some(false));
+        // Another namespace, or a bare pid with no namespace at all.
+        fs::write(&lock, format!("{me} pid:[1] {start}")).unwrap();
+        assert_eq!(owner_alive(&lock), None);
+        fs::write(&lock, format!("{me}\n")).unwrap();
+        assert_eq!(owner_alive(&lock), None);
+
+        // The detached compile writes its record from the shell.
+        fs::remove_file(&lock).unwrap();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "( set -C; {LOCK_RECORD_SH} > \"$0\" ) && cat \"$0\" && cut -d' ' -f22 /proc/$$/stat"
+            ))
+            .arg(&lock)
+            .output()
+            .unwrap();
+        let out = String::from_utf8(out.stdout).unwrap();
+        let mut lines = out.lines();
+        let rec: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(rec[1], ns);
+        assert_eq!(rec[2], lines.next().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn compile_lock_ticket_states() {
         let tmp = std::env::temp_dir().join(format!("veryl_aot_lock_{}", std::process::id()));
@@ -13049,7 +13136,7 @@ mod tests {
         {
             // `kill -0 0` addresses our own process group, so name a pid that
             // cannot exist rather than 0.
-            fs::write(&lock, format!("{}\n", u32::MAX)).unwrap();
+            fs::write(&lock, format!("{}\n", owner_record(u32::MAX))).unwrap();
             assert_eq!(owner_alive(&lock), Some(false));
             let retaken = acquire_compile_lock(&tmp, "deadbeef", &so);
             assert!(matches!(retaken, CompileTicket::Owned(_)));
