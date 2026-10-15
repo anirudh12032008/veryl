@@ -2217,6 +2217,77 @@ fn set_event_mode(on: bool) {
     EVENT_MODE.with(|c| c.set(on));
 }
 
+thread_local! {
+    /// Bodies of the event functions `outline_block` split off, in emit
+    /// order, so a callee always precedes its callers.
+    static OUTLINED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Emitted `for` bodies enclosing the current statement: a block there may
+    /// `break` or read the loop's C index, so it must stay inline.
+    static FOR_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A block smaller than this stays inline: splitting it saves the host
+/// compiler nothing.
+const OUTLINE_MIN_BYTES: usize = 512 * 1024;
+
+/// Join the emitted statements of one block, moving runs of them into
+/// separate event functions when the block is big.
+///
+/// An always_ff unrolled into a wide tree would otherwise be one C function
+/// past what the host compiler handles, or past [`max_stmt_bytes`].  The parts
+/// run in source order on the same buffers and FF stores go through the write
+/// log either way, so splitting does not change the result.  `pieces` pairs
+/// each statement's C with whether a part may end after it.
+fn outline_block(pieces: Vec<(String, bool)>) -> String {
+    let total: usize = pieces.iter().map(|(p, _)| p.len() + 1).sum();
+    let outline = event_mode()
+        && total >= OUTLINE_MIN_BYTES
+        && FOR_DEPTH.with(|d| d.get()) == 0
+        && std::env::var("VERYL_AOT_C_OUTLINE").as_deref() != Ok("0");
+    let mut out = String::new();
+    if !outline {
+        for (p, _) in pieces {
+            out.push_str(&p);
+            out.push(' ');
+        }
+        return out;
+    }
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut String| {
+        if cur.is_empty() {
+            return;
+        }
+        let k = OUTLINED.with(|o| {
+            let mut o = o.borrow_mut();
+            o.push(std::mem::take(cur));
+            o.len() - 1
+        });
+        out.push_str(&format!("veryl_aot_ol{k}{ENTRY_ARGS}; "));
+    };
+    for (p, may_end) in pieces {
+        cur.push_str(&p);
+        cur.push(' ');
+        if may_end && cur.len() >= ENTRY_PART_BYTES {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// The definitions of the functions [`outline_block`] split off.
+fn take_outlined() -> String {
+    let bodies = OUTLINED.with(|o| std::mem::take(&mut *o.borrow_mut()));
+    let mut out = String::new();
+    for (k, body) in bodies.iter().enumerate() {
+        out.push_str(&format!(
+            "static __attribute__((noinline)) void veryl_aot_ol{k}{ENTRY_SIG} {{\n{}}}\n\n",
+            df_local_marks(body)
+        ));
+    }
+    out
+}
+
 /// Whether a write to an FF wider than 8 bytes may leave the log unadvanced
 /// when the value it deposits is what its write slot already holds.  Not
 /// narrower FFs: their single entry costs too little to be worth a compare at
@@ -2410,6 +2481,7 @@ pub fn event_uncovered_census(stmts: &[ProtoStatement]) -> Vec<String> {
     for s in stmts {
         collect_uncovered(s, &mut out);
     }
+    OUTLINED.with(|o| o.borrow_mut().clear());
     set_event_mode(prev);
     out
 }
@@ -4636,6 +4708,7 @@ fn emit_event_function(
     clear_current_local();
     EVENT_NARROW_PUSHES.with(|c| c.set(0));
     EVENT_WIDE_PUSHES.with(|c| c.set(0));
+    OUTLINED.with(|o| o.borrow_mut().clear());
     let diag = std::env::var("VERYL_AOT_C_EVENT_DIAG").as_deref() == Ok("1");
     set_event_mode(true);
     EVENT_SKIP_UNCHANGED.with(|c| c.set(skip_unchanged));
@@ -4747,7 +4820,11 @@ fn emit_event_function(
     })();
     set_event_mode(false);
     EVENT_SKIP_UNCHANGED.with(|c| c.set(false));
-    let mut units = body_res?;
+    let Some(mut units) = body_res else {
+        OUTLINED.with(|o| o.borrow_mut().clear());
+        return None;
+    };
+    let outlined = take_outlined();
     let gate_fns = apply_event_gates(&mut units, gates);
     // > u32::MAX pushes per eval can't be reserved in one call; bail to
     // Cranelift (which checks per push) rather than under-reserving.
@@ -4768,6 +4845,7 @@ fn emit_event_function(
     src.push_str(WIDEOPS_C_INLINE);
     src.push_str(selection::INLINE);
     src.push('\n');
+    src.push_str(&outlined);
     src.push_str(&gate_fns);
     // The bulk reserve is the ENTRY PREAMBLE, not body text: split or not it
     // stays in `veryl_aot_eval` ahead of the parts, so it dominates every
@@ -7750,6 +7828,15 @@ fn writes_offset(body: &[ProtoStatement], vo: &VarOffset) -> bool {
 /// with constant or dynamic (≤64-bit) bounds and a loop var ≤ 64 bits;
 /// mirrors the Cranelift JIT gate (`ProtoForStatement::can_build_binary`).
 /// Stepped ranges (arbitrary-op advance) stay on the interpreter.
+/// Leaves the `for` body [`FOR_DEPTH`] counts, on every return path.
+struct ForDepthGuard;
+
+impl Drop for ForDepthGuard {
+    fn drop(&mut self) {
+        FOR_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 fn emit_for(for_stmt: &ProtoForStatement) -> Option<String> {
     if for_stmt.var_width == 0 || for_stmt.var_width > 64 {
         return None;
@@ -7888,6 +7975,8 @@ fn emit_for(for_stmt: &ProtoForStatement) -> Option<String> {
         });
     }
     let mut body = String::new();
+    FOR_DEPTH.with(|d| d.set(d.get() + 1));
+    let _for_depth = ForDepthGuard;
     for s in &for_stmt.body {
         let emitted = emit_stmt(s);
         if emitted.is_none() && substitute {
@@ -7930,12 +8019,11 @@ fn emit_block(stmts: &[ProtoStatement]) -> Option<String> {
     if let Some(marks) = df_marks() {
         return emit_block_watched(stmts, &marks);
     }
-    let mut s = String::new();
+    let mut pieces = Vec::with_capacity(stmts.len());
     for st in stmts {
-        s.push_str(&emit_stmt(st)?);
-        s.push(' ');
+        pieces.push((emit_stmt(st)?, true));
     }
-    Some(s)
+    Some(outline_block(pieces))
 }
 
 /// Whether `stmt` can leave the enclosing loop body, skipping what follows it.
@@ -7979,31 +8067,36 @@ fn emit_block_watched(stmts: &[ProtoStatement], marks: &DataflowMarks) -> Option
         }
     }
     let mut seen: HashMap<(u32, u32, u32), (usize, u64)> = HashMap::default();
-    let mut s = String::new();
+    let mut pieces = Vec::with_capacity(stmts.len());
+    // Snapshots declared and not yet compared: a part cannot end while one is
+    // live, as its declaration and its compare must share a C function.
+    let mut open = 0usize;
     for (i, (st, w)) in stmts.iter().zip(&watches).enumerate() {
         let Some(w) = w.as_ref().filter(|w| count[&key(i, w)] > 1) else {
-            s.push_str(&emit_stmt(st)?);
-            s.push(' ');
+            pieces.push((emit_stmt(st)?, open == 0));
             continue;
         };
         let entry = seen.entry(key(i, w)).or_insert_with(|| (0, df_wrap_seq()));
         entry.0 += 1;
         let (n, k) = *entry;
+        let mut s = String::new();
         if n == 1 && w.compared() {
             s.push_str(&w.head(k));
+            open += 1;
         }
         s.push_str(&emit_stmt_unwatched(st)?);
         s.push(' ');
         if n == count[&key(i, w)] {
             if w.compared() {
                 s.push_str(&w.tail(k));
+                open -= 1;
             } else {
                 s.push_str(&w.set());
             }
-            s.push(' ');
         }
+        pieces.push((s, open == 0));
     }
-    Some(s)
+    Some(outline_block(pieces))
 }
 
 /// A one-hot to binary encoder, `|({W{x[k]}} & k)` over the bits of `x`, as a
@@ -12066,6 +12159,166 @@ mod tests {
             reserve > entry,
             "the reserve sits before the entry, i.e. inside a part function",
         );
+    }
+
+    /// `c[i] = c[i - 1] + 1` over comb words `1..=n`, each a separate store.
+    fn comb_chain(n: usize) -> Vec<ProtoStatement> {
+        (1..=n)
+            .map(|i| {
+                ProtoStatement::Assign(ProtoAssignStatement {
+                    dst: VarOffset::Comb(8 * i as isize),
+                    dst_width: 64,
+                    select: None,
+                    dynamic_select: None,
+                    rhs_select: None,
+                    expr: ProtoExpression::Binary {
+                        x: Box::new(var_expr(VarOffset::Comb(8 * (i as isize - 1)), 64)),
+                        op: Op::Add,
+                        y: Box::new(const_expr(1, 64)),
+                        width: 64,
+                        expr_context: ctx(64, false),
+                    },
+                    dst_ff_current_offset: 0,
+                    comb_direct: false,
+                    token: dummy_token(),
+                })
+            })
+            .collect()
+    }
+
+    fn if_on(cond_off: isize, body: Vec<ProtoStatement>) -> ProtoStatement {
+        ProtoStatement::If(ProtoIfStatement {
+            cond: Some(var_expr(VarOffset::Comb(cond_off), 1)),
+            true_side: body,
+            false_side: vec![],
+        })
+    }
+
+    #[test]
+    fn a_big_event_if_runs_as_outlined_parts_in_source_order() {
+        // A chain crossing every part boundary must still see each store
+        // before the next.
+        const N: usize = 12000;
+        let cond = 8 * (N as isize + 1);
+        let src = emit_event_function(&[if_on(cond, comb_chain(N))], false, &[])
+            .expect("must emit as a function");
+        assert!(
+            src.contains("void veryl_aot_ol1("),
+            "the block must split into parts"
+        );
+        assert!(
+            src.find("void veryl_aot_ol0(") < src.find("void veryl_aot_eval("),
+            "parts are defined ahead of the entry",
+        );
+        if !cc_available() {
+            return;
+        }
+        for taken in [true, false] {
+            let mut comb = vec![0u8; 8 * (N + 2)];
+            comb[..8].copy_from_slice(&7u64.to_le_bytes());
+            comb[cond as usize] = taken as u8;
+            let mut ff = vec![0u8; 32];
+            if run_wide_ff_event_in(&src, "outline_chain", &mut ff, &mut comb).is_none() {
+                return;
+            }
+            let last = u64::from_le_bytes(comb[8 * N..8 * N + 8].try_into().unwrap());
+            assert_eq!(last, if taken { 7 + N as u64 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_big_block_in_a_loop_body_stays_inline() {
+        // A block under an emitted `for` may break out of it or read its C
+        // index, neither of which survives a move into another function.
+        let body = vec![if_on(8 * 13000, comb_chain(12000))];
+        let for_stmt = ProtoForStatement {
+            var_offset: VarOffset::Comb(8 * 13001),
+            var_width: 32,
+            var_native_bytes: 4,
+            var_signed: false,
+            token: TokenRange::default(),
+            range: ProtoForRange::Forward {
+                start: ProtoForBound::Const(0, true),
+                end: ProtoForBound::Const(2, true),
+                inclusive: false,
+                step: 1,
+            },
+            body,
+        };
+        let src = emit_event_function(&[ProtoStatement::For(for_stmt)], false, &[])
+            .expect("must emit as a function");
+        assert!(
+            !src.contains("veryl_aot_ol"),
+            "nothing under a loop is outlined"
+        );
+    }
+
+    #[test]
+    fn a_watched_store_run_keeps_its_snapshot_and_compare_in_one_part() {
+        // Two stores to one marked span share a snapshot taken before the
+        // first and compared after the last.
+        const N: usize = 12000;
+        let cond = 8 * (N as isize + 1);
+        let watched = 8 * (N as isize + 2);
+        let store = |v: u64| {
+            ProtoStatement::Assign(ProtoAssignStatement {
+                dst: VarOffset::Comb(watched),
+                dst_width: 64,
+                select: None,
+                dynamic_select: None,
+                rhs_select: None,
+                expr: const_expr(v, 64),
+                dst_ff_current_offset: 0,
+                comb_direct: false,
+                token: dummy_token(),
+            })
+        };
+        let mut body = vec![store(1)];
+        body.extend(comb_chain(N));
+        body.push(store(5));
+        let w = watched as u32;
+        set_dataflow_event_marks(Some(Arc::new(vec![(w, w + 8, vec![(0, 0x4)])])));
+        let src = emit_event_function(&[if_on(cond, body)], false, &[]);
+        set_dataflow_event_marks(None);
+        let src = src.expect("must emit as a function");
+        assert!(src.contains("veryl_aot_ol0"), "the block is still outlined");
+        let part_of = |pat: &str| {
+            let at = src.find(pat).expect("emitted");
+            src[..at].rfind("void veryl_aot_ol")
+        };
+        assert_eq!(
+            part_of("uint8_t _dfs"),
+            part_of("__builtin_memcmp(_dfs"),
+            "snapshot and compare share a part",
+        );
+        if !cc_available() {
+            return;
+        }
+        let mut comb = vec![0u8; 8 * (N + 3)];
+        comb[cond as usize] = 1;
+        let mut ff = vec![0u8; 32];
+        let tmp =
+            std::env::temp_dir().join(format!("veryl_aot_outline_watch_{}", std::process::id()));
+        let Some(module) = compile_for_test(&tmp, &src, "outline_watch") else {
+            return;
+        };
+        let mut log = vec![0u8; 256];
+        let mut delta = [0u64; 1];
+        unsafe {
+            (module.func)(
+                ff.as_mut_ptr(),
+                comb.as_mut_ptr(),
+                log.as_mut_ptr(),
+                delta.as_mut_ptr() as isize,
+            );
+        }
+        let v = u64::from_le_bytes(
+            comb[watched as usize..watched as usize + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(v, 5);
+        assert_eq!(delta[0], 0x4, "the changed span is marked");
     }
 
     #[test]
