@@ -28366,6 +28366,96 @@ fn comb_display_output_matches_across_backends() {
 }
 
 #[test]
+fn event_display_of_wide_args_keeps_the_event_aot_native() {
+    // A print argument wider than 64 bits must keep the clock event on AOT-C
+    // and print as the other backends do.
+    let code = r#"
+    module Top (
+        clk: input  clock    ,
+        rst: input  reset    ,
+        a  : input  logic<64>,
+        b  : input  logic<64>,
+        o  : output logic<64>,
+    ) {
+        var q: logic<64>;
+        var s: signed logic<100>;
+        var w: logic<200>;
+        always_ff (clk, rst) {
+            if_reset {
+                q = 0;
+                s = 0;
+                w = 0;
+            } else {
+                if a[0] {
+                    $write("c=%h ", {b, a});
+                    if a[1] {
+                        $write("w=%h ", w);
+                    }
+                    $display("s=%d q=%h", s, q);
+                }
+                q = q + a;
+                s = 0 - {36'd0, a};
+                w = {b, a, b[7:0], a};
+            }
+        }
+        assign o = q;
+    }
+    "#;
+
+    if crate::tests::aot_c_loads() {
+        let ir = analyze(code, &aot_native_validate_config());
+        let missing: Vec<_> = ir
+            .event_statements
+            .keys()
+            .filter(|e| matches!(e, Event::Clock(..)) && !ir.whole_events.contains_key(e))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "clock event not AOT-C-native: {missing:?}"
+        );
+    }
+
+    // The validated run prints through Cranelift, so the AOT-C print is
+    // only compared by the unvalidated one.
+    let mut configs = Config::all();
+    if crate::tests::aot_c_loads() {
+        configs.push(Config {
+            aot_c_validate: false,
+            ..aot_native_validate_config()
+        });
+        configs.push(aot_native_validate_config());
+    }
+    let mut seen: Option<String> = None;
+    for config in configs {
+        output_buffer::enable();
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        let clk = sim.get_clock("clk").unwrap();
+        let rst = sim.get_reset("rst").unwrap();
+        sim.step_reset(&clk, &rst);
+        for (a, b) in [
+            (0x8000_0000_0000_0003u64, 0x1122_3344_5566_7788u64),
+            (0xffff_ffff_ffff_fffb, 0xdead_beef_0000_0001),
+            (0x0000_0000_0000_0002, 0xffff_ffff_ffff_ffff),
+            (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+        ] {
+            sim.set("a", Value::new(a, 64, false));
+            sim.set("b", Value::new(b, 64, false));
+            sim.step(&clk);
+        }
+        let output = output_buffer::take();
+        assert!(
+            output.contains("c=11223344556677888000000000000003 "),
+            "config={config:?} output={output:?}"
+        );
+        match &seen {
+            None => seen = Some(output),
+            Some(first) => assert_eq!(&output, first, "config={config:?}"),
+        }
+    }
+}
+
+#[test]
 fn wide_ff_array_element_bit_select_store() {
     // `arr[idx][hi:lo] <= v` and `arr[idx][j +: w] <= v` on an array of
     // >128-bit FF elements: a runtime element index combined with a bit-select

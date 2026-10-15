@@ -883,15 +883,16 @@ pub fn format_output(format_str: &str, values: &[AnalyzerValue]) -> String {
 /// Mirrors `SystemFunctionCall::{Display,Write}::eval_step` so emitted output is
 /// byte-identical and flows through the same thread-local `output_buffer` (which
 /// prevents interleaving across parallel tests).  `fmt`/`fmt_len` carry the Veryl
-/// format-string bytes; `vals`/`widths` carry `n` argument payloads (≤ 64 bits —
-/// the emitter bails to Cranelift for wider args); `newline` is 1 for `$display`,
+/// format-string bytes; `widths` carries `n` packed argument widths and `vals`
+/// their payloads, `ceil(width / 64)` words per argument, least significant
+/// first; `newline` is 1 for `$display`,
 /// 0 for `$write`.  The pointer is handed to the `.so` via `veryl_set_sysfn_cb`
 /// in `compile_source`.
 ///
 /// # Safety
 /// `fmt` must point to `fmt_len` readable bytes (or be null with `fmt_len` 0),
-/// and `vals`/`widths` to `n` readable elements (or null with `n` 0).  Emitted
-/// code always satisfies this.
+/// `widths` to `n` readable elements and `vals` to the words they describe (or
+/// both null with `n` 0).  Emitted code always satisfies this.
 pub unsafe extern "C" fn veryl_aot_sysfn_print(
     fmt: *const u8,
     fmt_len: usize,
@@ -909,9 +910,9 @@ pub unsafe extern "C" fn veryl_aot_sysfn_print(
     let values: Vec<AnalyzerValue> = if n == 0 || vals.is_null() || widths.is_null() {
         Vec::new()
     } else {
+        let mut at = 0usize;
         (0..n)
             .map(|i| {
-                let v = unsafe { *vals.add(i) };
                 // `widths[i]` packs the bit width (low 16 bits) with the
                 // signedness flag (bit 16); see `emit_event_print`.  Signedness
                 // changes %d/%s output, so it must match the interpreter's
@@ -919,7 +920,18 @@ pub unsafe extern "C" fn veryl_aot_sysfn_print(
                 let packed = unsafe { *widths.add(i) } as usize;
                 let width = packed & 0xffff;
                 let signed = (packed >> 16) & 1 != 0;
-                AnalyzerValue::new(v, width, signed)
+                let nw = width.div_ceil(64).max(1);
+                let words = unsafe { std::slice::from_raw_parts(vals.add(at), nw) };
+                at += nw;
+                if width <= 64 {
+                    AnalyzerValue::new(words[0], width, signed)
+                } else {
+                    let digits: Vec<u32> = words
+                        .iter()
+                        .flat_map(|w| [*w as u32, (*w >> 32) as u32])
+                        .collect();
+                    AnalyzerValue::new_biguint(BigUint::new(digits), width, signed)
+                }
             })
             .collect()
     };

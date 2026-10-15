@@ -4840,8 +4840,9 @@ fn emit_reserve_prologue(narrow: u32, wide: u32) -> String {
 /// Event-path `$display` / `$write` → a call into the Rust formatter
 /// (`veryl_sysfn_cb`, wired by `compile_source`), instead of bailing.  Reuses
 /// the interpret path's formatting + `output_buffer` for byte-identical,
-/// correctly-buffered output.  Args must be ≤ 64 bits (wider → bail to
-/// Cranelift, preserving correctness).  `newline` = true for `$display`.
+/// correctly-buffered output.  Each argument takes `ceil(width / 64)`
+/// consecutive words of `_v`, least significant first; `_w` holds one entry
+/// per argument.  `newline` = true for `$display`.
 fn emit_event_print(format_str: &str, args: &[ProtoExpression], newline: bool) -> Option<String> {
     let n = args.len();
     let nl = newline as u32;
@@ -4859,25 +4860,48 @@ fn emit_event_print(format_str: &str, args: &[ProtoExpression], newline: bool) -
         ));
         return Some(s);
     }
-    s.push_str(&format!(
-        " unsigned long long _v[{n}]; unsigned int _w[{n}];"
-    ));
+    let mut body = String::new();
+    let mut nv = 0usize;
     for (i, arg) in args.iter().enumerate() {
         let w = arg.width();
-        if w == 0 || w > 64 {
-            return None; // wide arg → bail to Cranelift
+        // The width field is 16 bits wide in the packed `_w` entry.
+        if w == 0 || w > 0xffff {
+            return None;
         }
-        let e = emit_expr(arg)?;
-        let mask = width_mask(w);
         // Pack signedness (bit 16) alongside the width so the Rust formatter
         // rebuilds the AnalyzerValue exactly as the interpreter's eval() would
         // — signedness changes %d/%s output (signed decimal) and the event
         // path must match the Cranelift/interpret path byte-for-byte.
         let packed = w | ((arg.expr_context().signed as usize) << 16);
-        s.push_str(&format!(
-            " _v[{i}] = (unsigned long long)({e}) & 0x{mask:x}ULL; _w[{i}] = {packed}u;"
-        ));
+        if w <= 64 {
+            let e = emit_expr(arg)?;
+            let mask = width_mask(w);
+            body.push_str(&format!(
+                " _v[{nv}] = (unsigned long long)({e}) & 0x{mask:x}ULL;"
+            ));
+            nv += 1;
+        } else {
+            let nw = w.div_ceil(64);
+            let mut pre = String::new();
+            let r = emit_wide_operand(arg, native_bytes(w), &mut pre)?;
+            body.push_str(&format!(" {{ {pre}"));
+            for k in 0..nw {
+                let bits = (w - 64 * k).min(64);
+                body.push_str(&format!(
+                    " _v[{}] = (unsigned long long)VW_RD({addr}, {k}) & 0x{mask:x}ULL;",
+                    nv + k,
+                    addr = r.addr,
+                    mask = width_mask(bits),
+                ));
+            }
+            body.push_str(" }");
+            nv += nw;
+        }
+        body.push_str(&format!(" _w[{i}] = {packed}u;"));
     }
+    s.push_str(&format!(
+        " unsigned long long _v[{nv}]; unsigned int _w[{n}];{body}"
+    ));
     s.push_str(&format!(
         " if (veryl_sysfn_cb) veryl_sysfn_cb(_f, (uintptr_t){flen}u, _v, _w, (uintptr_t){n}u, {nl}u); }}"
     ));
