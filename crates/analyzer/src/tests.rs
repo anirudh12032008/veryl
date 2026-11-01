@@ -1314,6 +1314,36 @@ fn cyclic_file_dependency() {
 }
 
 #[test]
+fn global_generic_function_argument_is_not_a_file_dependency() {
+    let inputs = vec![
+        r#"
+        package a_pkg {
+          function w (n: input u32) -> u32 {
+            return n + 1;
+          }
+        }
+        function g::<W: u32> (a: input logic<W>) -> logic {
+          return a[W - 1];
+        }
+        "#,
+        r#"
+        package b_pkg {
+          const X: u32 = a_pkg::w(3);
+          function h (a: input logic<X>) -> logic {
+            return g::<X>(a);
+          }
+        }
+        module b_module (a: input logic<4>, o: output logic) {
+          assign o = g::<b_pkg::X>(a);
+        }
+        "#,
+    ];
+
+    let errors = analyze_multiple_inputs(&inputs);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
 fn duplicated_identifier_clock_domain_label() {
     use crate::analyzer_error::DuplicatedIdentifierKind;
 
