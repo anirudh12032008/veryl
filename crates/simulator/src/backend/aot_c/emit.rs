@@ -4840,8 +4840,9 @@ fn emit_reserve_prologue(narrow: u32, wide: u32) -> String {
 /// Event-path `$display` / `$write` → a call into the Rust formatter
 /// (`veryl_sysfn_cb`, wired by `compile_source`), instead of bailing.  Reuses
 /// the interpret path's formatting + `output_buffer` for byte-identical,
-/// correctly-buffered output.  Args must be ≤ 64 bits (wider → bail to
-/// Cranelift, preserving correctness).  `newline` = true for `$display`.
+/// correctly-buffered output.  Each argument takes `ceil(width / 64)`
+/// consecutive words of `_v`, least significant first; `_w` holds one entry
+/// per argument.  `newline` = true for `$display`.
 fn emit_event_print(format_str: &str, args: &[ProtoExpression], newline: bool) -> Option<String> {
     let n = args.len();
     let nl = newline as u32;
@@ -4859,25 +4860,48 @@ fn emit_event_print(format_str: &str, args: &[ProtoExpression], newline: bool) -
         ));
         return Some(s);
     }
-    s.push_str(&format!(
-        " unsigned long long _v[{n}]; unsigned int _w[{n}];"
-    ));
+    let mut body = String::new();
+    let mut nv = 0usize;
     for (i, arg) in args.iter().enumerate() {
         let w = arg.width();
-        if w == 0 || w > 64 {
-            return None; // wide arg → bail to Cranelift
+        // The width field is 16 bits wide in the packed `_w` entry.
+        if w == 0 || w > 0xffff {
+            return None;
         }
-        let e = emit_expr(arg)?;
-        let mask = width_mask(w);
         // Pack signedness (bit 16) alongside the width so the Rust formatter
         // rebuilds the AnalyzerValue exactly as the interpreter's eval() would
         // — signedness changes %d/%s output (signed decimal) and the event
         // path must match the Cranelift/interpret path byte-for-byte.
         let packed = w | ((arg.expr_context().signed as usize) << 16);
-        s.push_str(&format!(
-            " _v[{i}] = (unsigned long long)({e}) & 0x{mask:x}ULL; _w[{i}] = {packed}u;"
-        ));
+        if w <= 64 {
+            let e = emit_expr(arg)?;
+            let mask = width_mask(w);
+            body.push_str(&format!(
+                " _v[{nv}] = (unsigned long long)({e}) & 0x{mask:x}ULL;"
+            ));
+            nv += 1;
+        } else {
+            let nw = w.div_ceil(64);
+            let mut pre = String::new();
+            let r = emit_wide_operand(arg, native_bytes(w), &mut pre)?;
+            body.push_str(&format!(" {{ {pre}"));
+            for k in 0..nw {
+                let bits = (w - 64 * k).min(64);
+                body.push_str(&format!(
+                    " _v[{}] = (unsigned long long)VW_RD({addr}, {k}) & 0x{mask:x}ULL;",
+                    nv + k,
+                    addr = r.addr,
+                    mask = width_mask(bits),
+                ));
+            }
+            body.push_str(" }");
+            nv += nw;
+        }
+        body.push_str(&format!(" _w[{i}] = {packed}u;"));
     }
+    s.push_str(&format!(
+        " unsigned long long _v[{nv}]; unsigned int _w[{n}];{body}"
+    ));
     s.push_str(&format!(
         " if (veryl_sysfn_cb) veryl_sysfn_cb(_f, (uintptr_t){flen}u, _v, _w, (uintptr_t){n}u, {nl}u); }}"
     ));
@@ -5348,7 +5372,7 @@ fn compile_source_in(cache_dir: &Path, src: &str) -> Result<EmittedModule, Strin
             // The shell, not us, owns the publish, so its pid is what tells
             // a waiter whether the lock is still live (see `owner_alive`).
             if let Some(lp) = &lock_path {
-                let _ = fs::write(lp, format!("{}\n", child.id()));
+                let _ = fs::write(lp, format!("{}\n", owner_record(child.id())));
             }
             child
                 .wait_with_output()
@@ -5576,10 +5600,11 @@ pub fn detach_pending_compiles() {
         // `exec` keeps the pid written into the lock for the compile.
         let temps: Vec<String> = staged.temps.iter().map(|t| quote(t.as_os_str())).collect();
         let mut body = format!(
-            "rm -f \"$0\"\n[ -e {so} ] && {{ rm -f {t}; exit 0; }}\n( set -C; echo $$ > {lk} ) 2>/dev/null || {{ rm -f {t}; exit 0; }}\nexec /bin/sh -c {}",
+            "rm -f \"$0\"\n[ -e {so} ] && {{ rm -f {t}; exit 0; }}\n( set -C; {rec} > {lk} ) 2>/dev/null || {{ rm -f {t}; exit 0; }}\nexec /bin/sh -c {}",
             quote(staged.script.as_ref()),
             so = quote(so_path.as_os_str()),
             lk = quote(lock_path.as_os_str()),
+            rec = LOCK_RECORD_SH,
             t = temps.join(" "),
         );
         for a in &staged.args {
@@ -5760,18 +5785,60 @@ enum CompileTicket {
 /// taken over at once instead — see [`owner_alive`].
 const COMPILE_LOCK_STALE: Duration = Duration::from_secs(600);
 
+/// A lock file's owner record, `pid pidns starttime`: a pid alone is
+/// ambiguous across pid namespaces and after reuse.  Either extra field is
+/// empty when procfs cannot tell.
+fn owner_record(pid: u32) -> String {
+    let ns = pid_namespace().unwrap_or_default();
+    let start = proc_start_time(pid).unwrap_or_default();
+    format!("{pid} {ns} {start}")
+}
+
+/// This process's pid namespace (`pid:[inode]`), when procfs shows it.
+fn pid_namespace() -> Option<String> {
+    let ns = fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(ns.to_string_lossy().into_owned())
+}
+
+/// Field 22 of `/proc/<pid>/stat`, the start time in clock ticks since boot.
+/// The command name in field 2 may itself hold spaces and parentheses, so the
+/// fields are counted from its closing parenthesis.
+fn proc_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19).map(str::to_string)
+}
+
+/// [`owner_record`] of the running shell, for a lock the shell takes itself.
+#[cfg(unix)]
+const LOCK_RECORD_SH: &str = r#"s=$(cat /proc/$$/stat 2>/dev/null); s=${s##*) }; set -- $s; echo "$$ $(readlink /proc/self/ns/pid 2>/dev/null) ${20}""#;
+
 /// Is the compile shell recorded in a lock file still running?
 ///
 /// The publishing shell outlives us on purpose, so its pid — not ours — is
 /// what makes a lock meaningful.  Without this check a run killed mid-compile
 /// would hold the artifact hostage for [`COMPILE_LOCK_STALE`].
-/// `None` = no pid recorded yet; fall back to the age rule.
+/// `None` = the owner cannot be identified (no pid recorded yet, or one that
+/// procfs cannot vouch for); fall back to the age rule.
 fn owner_alive(lock_path: &Path) -> Option<bool> {
-    let pid: u32 = fs::read_to_string(lock_path).ok()?.trim().parse().ok()?;
+    let text = fs::read_to_string(lock_path).ok()?;
+    let mut fields = text.split_whitespace();
+    let pid: u32 = fields.next()?.parse().ok()?;
     // Linux: procfs is authoritative and free.  Guarded by /proc/self so a
     // system without procfs doesn't read every pid as dead.
     if Path::new("/proc/self").exists() {
-        return Some(Path::new(&format!("/proc/{pid}")).exists());
+        // A pid from another pid namespace names an unrelated process here,
+        // or none; trusting a live-looking one would hold the lock forever.
+        let ns = fields.next()?;
+        if pid_namespace().as_deref() != Some(ns) {
+            return None;
+        }
+        let Some(now) = proc_start_time(pid) else {
+            return Some(false);
+        };
+        // A different start time is a reused pid; none recorded leaves the
+        // pid's existence as the only evidence.
+        return Some(fields.next().is_none_or(|start| start == now));
     }
     // Other unix: `kill -0` through the shell we already use, so this needs
     // no libc dependency.
@@ -10318,10 +10385,6 @@ fn expr_c_type(width: usize) -> Option<&'static str> {
     }
 }
 
-/// Above this many statements a dataflow comb gets no whole-settle entry,
-/// which would repeat every statement.
-const DATAFLOW_COARSE_MAX_STMTS: usize = 20_000;
-
 /// The comb offsets each unit may keep in locals, with their widths: written
 /// in the unit and read nowhere else.
 fn local_sets_of(units: &[&[&ProtoStatement]]) -> Vec<HashSet<(isize, usize)>> {
@@ -10391,16 +10454,11 @@ pub fn emit_dataflow_function(
             }
         })
         .collect();
-    // A small comb also gets a whole-settle entry that runs every statement
-    // with no per-cell test, compare or mark, for the runtime to pick when
-    // most cells run anyway.  Its parts cut the cells' concatenated order.
-    let n_stmts: usize = cells.iter().map(|c| c.len()).sum();
-    let coarse = n_stmts <= DATAFLOW_COARSE_MAX_STMTS;
-    let all: Vec<&ProtoStatement> = if coarse {
-        cells.iter().flatten().copied().collect()
-    } else {
-        Vec::new()
-    };
+    // The comb also gets a whole-settle entry that runs every statement with
+    // no per-cell test, compare or mark, for the runtime to pick when most
+    // cells run anyway.  Its parts cut the cells' concatenated order, so no
+    // function grows with the design; only the source doubles.
+    let all: Vec<&ProtoStatement> = cells.iter().flatten().copied().collect();
     let coarse_parts: Vec<&[&ProtoStatement]> = all.chunks(PART_LEN).collect();
     let local_sets = local_sets_of(&parts.iter().map(|p| p.1).collect::<Vec<_>>());
     // A whole-settle part keeps in locals only what a cell's part does too:
@@ -10614,36 +10672,32 @@ pub fn emit_dataflow_function(
     body.push_str(&entry("veryl_aot_eval", ""));
     // A counting copy for the runtime to weigh against the whole-settle
     // entry; only probes take it, as counting costs every call.
-    if coarse {
+    body.push_str(&format!(
+        "static const uint32_t veryl_cell_stmts[{n}] = {{{}}};\n",
+        cells
+            .iter()
+            .map(|c| c.len().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    body.push_str(&entry(
+        "veryl_aot_eval_counted",
+        "\x20           write_log[0] += veryl_cell_stmts[k];\n\
+         \x20           write_log[1]++;\n",
+    ));
+    body.push_str(&format!(
+        "{ENTRY_ATTR}\n\
+         void veryl_aot_eval_coarse(uint8_t *__restrict__ ff_values, uint8_t *__restrict__ comb_values, uint64_t *__restrict__ write_log, intptr_t ff_delta) {{\n\
+         \x20   (void)write_log;\n\
+         \x20   uint64_t *dirty = (uint64_t *)ff_delta;\n"
+    ));
+    for q in 0..coarse_parts.len() {
         body.push_str(&format!(
-            "static const uint32_t veryl_cell_stmts[{n}] = {{{}}};\n",
-            cells
-                .iter()
-                .map(|c| c.len().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        body.push_str(&entry(
-            "veryl_aot_eval_counted",
-            "\x20           write_log[0] += veryl_cell_stmts[k];\n\
-             \x20           write_log[1]++;\n",
+            "    veryl_aot_chunk_{}(ff_values, comb_values, dirty);\n",
+            coarse_base + q
         ));
     }
-    if coarse {
-        body.push_str(&format!(
-            "{ENTRY_ATTR}\n\
-             void veryl_aot_eval_coarse(uint8_t *__restrict__ ff_values, uint8_t *__restrict__ comb_values, uint64_t *__restrict__ write_log, intptr_t ff_delta) {{\n\
-             \x20   (void)write_log;\n\
-             \x20   uint64_t *dirty = (uint64_t *)ff_delta;\n"
-        ));
-        for q in 0..coarse_parts.len() {
-            body.push_str(&format!(
-                "    veryl_aot_chunk_{}(ff_values, comb_values, dirty);\n",
-                coarse_base + q
-            ));
-        }
-        body.push_str("}\n");
-    }
+    body.push_str("}\n");
     Some(body)
 }
 
@@ -11430,6 +11484,41 @@ mod tests {
         assert!(s.contains("comb_values + 0x20"));
         assert!(s.contains("veryl_u32_ua"));
         assert!(s.contains("0xdeadbeefULL"));
+    }
+
+    #[test]
+    fn dataflow_whole_settle_entry_has_no_size_cap() {
+        let stmts: Vec<ProtoStatement> = (0..40_000)
+            .map(|i| {
+                ProtoStatement::Assign(ProtoAssignStatement {
+                    dst: VarOffset::Comb(i * 8),
+                    dst_width: 32,
+                    select: None,
+                    dynamic_select: None,
+                    rhs_select: None,
+                    expr: const_expr(i as u64, 32),
+                    dst_ff_current_offset: 0,
+                    comb_direct: false,
+                    token: dummy_token(),
+                })
+            })
+            .collect();
+        let cells: Vec<Vec<u32>> = (0..stmts.len() as u32)
+            .collect::<Vec<_>>()
+            .chunks(64)
+            .map(|c| c.to_vec())
+            .collect();
+        let n = cells.len();
+        let plan = crate::ir::opt::dataflow::DataflowPlan {
+            cells,
+            boundary: vec![Vec::new(); n],
+            consumers: vec![Vec::new(); n],
+            mark_always: vec![false; n],
+            ..Default::default()
+        };
+        let src = emit_dataflow_function(&stmts, &plan).unwrap();
+        assert!(src.contains("void veryl_aot_eval_coarse("));
+        assert_eq!(src.matches("0x9c3fULL").count(), 2);
     }
 
     #[test]
@@ -12967,6 +13056,50 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn compile_lock_owner_from_another_pid_namespace_ages_out() {
+        // Only a record procfs can vouch for decides; anything else falls
+        // back to the age rule.
+        if pid_namespace().is_none() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("veryl_aot_lockns_{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let lock = tmp.join("veryl_aot_cafe.lock");
+        let me = std::process::id();
+        let ns = pid_namespace().unwrap();
+        let start = proc_start_time(me).unwrap();
+
+        fs::write(&lock, owner_record(me)).unwrap();
+        assert_eq!(owner_alive(&lock), Some(true));
+        // A reused pid: same namespace, different start time.
+        fs::write(&lock, format!("{me} {ns} {start}0")).unwrap();
+        assert_eq!(owner_alive(&lock), Some(false));
+        // Another namespace, or a bare pid with no namespace at all.
+        fs::write(&lock, format!("{me} pid:[1] {start}")).unwrap();
+        assert_eq!(owner_alive(&lock), None);
+        fs::write(&lock, format!("{me}\n")).unwrap();
+        assert_eq!(owner_alive(&lock), None);
+
+        // The detached compile writes its record from the shell.
+        fs::remove_file(&lock).unwrap();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "( set -C; {LOCK_RECORD_SH} > \"$0\" ) && cat \"$0\" && cut -d' ' -f22 /proc/$$/stat"
+            ))
+            .arg(&lock)
+            .output()
+            .unwrap();
+        let out = String::from_utf8(out.stdout).unwrap();
+        let mut lines = out.lines();
+        let rec: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(rec[1], ns);
+        assert_eq!(rec[2], lines.next().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn compile_lock_ticket_states() {
         let tmp = std::env::temp_dir().join(format!("veryl_aot_lock_{}", std::process::id()));
@@ -13003,7 +13136,7 @@ mod tests {
         {
             // `kill -0 0` addresses our own process group, so name a pid that
             // cannot exist rather than 0.
-            fs::write(&lock, format!("{}\n", u32::MAX)).unwrap();
+            fs::write(&lock, format!("{}\n", owner_record(u32::MAX))).unwrap();
             assert_eq!(owner_alive(&lock), Some(false));
             let retaken = acquire_compile_lock(&tmp, "deadbeef", &so);
             assert!(matches!(retaken, CompileTicket::Owned(_)));
