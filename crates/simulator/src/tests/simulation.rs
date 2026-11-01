@@ -31331,6 +31331,95 @@ fn an_unpacked_array_parameter_element_sizes_a_child() {
     }
 }
 
+/// Each iteration rewrites its temporaries before reading them: `k` under
+/// the guard it is read under, `s` bit by bit.  The next iteration's writes
+/// come later in the pass but never reach those reads.
+#[test]
+fn loop_temporaries_rewritten_each_iteration_settle_in_one_pass() {
+    let code = r#"
+    module Top (
+        x : input  logic<32>,
+        fa: input  logic<4> ,
+        y : output logic<32>,
+        z : output logic<4> ,
+        fy: output logic<4> ,
+    ) {
+        always_comb {
+            for l in 0..4 {
+                let kind: logic<4> = x[8 * l+:4];
+                if kind <: 5 || kind >= 12 {
+                    let k: logic<4> = x[8 * l + 4+:4] ^ kind;
+                    y[8 * l+:8] = {k, k + 4'd1};
+                } else {
+                    y[8 * l+:8] = {kind, 4'd0};
+                }
+            }
+        }
+        always_comb {
+            for e in 0..4 {
+                var s: logic<4>;
+                for w in 0..4 {
+                    s[w] = x[8 * w + e];
+                }
+                z[e] = |s;
+            }
+        }
+        // A block reassigning a variable is not kept whole, so the
+        // statements above are ordered one by one.
+        var ft : logic<4>;
+        var fx : logic<4>;
+        var fx2: logic<4>;
+        always_comb {
+            ft = fa;
+            fx = ft;
+            ft = ~fa;
+            fy = ft ^ fx2;
+        }
+        always_comb {
+            fx2 = fx + 1;
+        }
+    }
+    "#;
+    let expect = |x: u64| -> (u64, u64) {
+        let mut y = 0;
+        let mut z = 0;
+        for l in 0..4 {
+            let kind = (x >> (8 * l)) & 0xf;
+            let byte = if !(5..12).contains(&kind) {
+                let k = ((x >> (8 * l + 4)) & 0xf) ^ kind;
+                (k << 4) | ((k + 1) & 0xf)
+            } else {
+                kind << 4
+            };
+            y |= byte << (8 * l);
+        }
+        for e in 0..4 {
+            if (0..4).any(|w| x >> (8 * w + e) & 1 == 1) {
+                z |= 1 << e;
+            }
+        }
+        (y, z)
+    };
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        assert_eq!(ir.required_comb_passes, 1, "{config:?}");
+        let mut sim = Simulator::new(ir, None);
+        for x in [
+            0x0000_0000u64,
+            0x1234_5678,
+            0xc3a5_0f1e,
+            0x8888_0001,
+            0xffff_ffff,
+        ] {
+            sim.set("x", Value::new(x, 32, false));
+            sim.set("fa", Value::new(x & 0xf, 4, false));
+            let (y, z) = expect(x);
+            assert_eq!(sim.get("y").unwrap().payload_u64(), y, "{config:?} {x:x}");
+            assert_eq!(sim.get("z").unwrap().payload_u64(), z, "{config:?} {x:x}");
+        }
+    }
+}
+
 #[test]
 fn a_reduction_tree_inside_one_vector_settles_in_one_pass() {
     // Every node of the tree lives in ONE packed vector, so each statement
