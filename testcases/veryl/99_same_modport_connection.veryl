@@ -23,9 +23,7 @@ module ModuleSameModportLeaf (
 module ModuleSameModportMid (
     p: modport InterfaceSameModport::left_relay,
 ) {
-    inst u: ModuleSameModportLeaf (
-        p,
-    );
+    inst u: ModuleSameModportLeaf ( p );
 }
 
 module ModuleSameModportTop (
