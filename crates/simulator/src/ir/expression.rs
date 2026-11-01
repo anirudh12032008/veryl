@@ -931,15 +931,7 @@ impl ProtoExpression {
     pub fn reads_offset(&self, off: VarOffset) -> bool {
         let mut ranges: Vec<(bool, isize, isize, usize)> = Vec::new();
         self.gather_dynamic_read_ranges(&mut ranges);
-        let raw = off.raw();
-        let in_span = ranges.iter().any(|&(is_ff, base, stride, num_elements)| {
-            is_ff == off.is_ff()
-                && stride > 0
-                && raw >= base
-                && raw < base.saturating_add(stride.saturating_mul(num_elements as isize))
-                && (raw - base) % stride == 0
-        });
-        if in_span {
+        if dynamic_ranges_contain(&ranges, off) {
             return true;
         }
         // Everything else — plain reads, index sub-expressions, and the
@@ -1059,6 +1051,19 @@ impl ProtoExpression {
             }
         }
     }
+}
+
+/// Whether `off` is an element of one of `ranges`, as recorded by
+/// `gather_dynamic_read_ranges`.
+pub fn dynamic_ranges_contain(ranges: &[(bool, isize, isize, usize)], off: VarOffset) -> bool {
+    let raw = off.raw();
+    ranges.iter().any(|&(is_ff, base, stride, num_elements)| {
+        is_ff == off.is_ff()
+            && stride > 0
+            && raw >= base
+            && raw < base.saturating_add(stride.saturating_mul(num_elements as isize))
+            && (raw - base) % stride == 0
+    })
 }
 
 /// Dynamic bit selection for packed arrays / part-selects.
@@ -1265,6 +1270,195 @@ impl std::hash::Hash for ProtoHierVariable {
 }
 
 impl ProtoExpression {
+    /// Whether both trees compute the same value from the same storage.  A
+    /// hierarchical reference is resolved before any caller can ask, so it
+    /// never compares equal.
+    pub fn same_structure(&self, other: &ProtoExpression) -> bool {
+        fn same_dyn(a: &Option<ProtoDynamicBitSelect>, b: &Option<ProtoDynamicBitSelect>) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same_structure(b),
+                _ => false,
+            }
+        }
+        match (self, other) {
+            (
+                ProtoExpression::Resize {
+                    x,
+                    width,
+                    sign_extend,
+                    expr_context,
+                },
+                ProtoExpression::Resize {
+                    x: x2,
+                    width: width2,
+                    sign_extend: sign_extend2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                width == width2
+                    && sign_extend == sign_extend2
+                    && expr_context == expr_context2
+                    && x.same_structure(x2)
+            }
+            (
+                ProtoExpression::Variable {
+                    var_offset,
+                    select,
+                    dynamic_select,
+                    width,
+                    var_full_width,
+                    expr_context,
+                },
+                ProtoExpression::Variable {
+                    var_offset: var_offset2,
+                    select: select2,
+                    dynamic_select: dynamic_select2,
+                    width: width2,
+                    var_full_width: var_full_width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                var_offset == var_offset2
+                    && select == select2
+                    && width == width2
+                    && var_full_width == var_full_width2
+                    && expr_context == expr_context2
+                    && same_dyn(dynamic_select, dynamic_select2)
+            }
+            (
+                ProtoExpression::Value {
+                    value,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::Value {
+                    value: value2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => value == value2 && width == width2 && expr_context == expr_context2,
+            (
+                ProtoExpression::Unary {
+                    op,
+                    x,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::Unary {
+                    op: op2,
+                    x: x2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                op == op2
+                    && width == width2
+                    && expr_context == expr_context2
+                    && x.same_structure(x2)
+            }
+            (
+                ProtoExpression::Binary {
+                    x,
+                    op,
+                    y,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::Binary {
+                    x: x2,
+                    op: op2,
+                    y: y2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                op == op2
+                    && width == width2
+                    && expr_context == expr_context2
+                    && x.same_structure(x2)
+                    && y.same_structure(y2)
+            }
+            (
+                ProtoExpression::Concatenation {
+                    elements,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::Concatenation {
+                    elements: elements2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                width == width2
+                    && expr_context == expr_context2
+                    && elements.len() == elements2.len()
+                    && elements
+                        .iter()
+                        .zip(elements2)
+                        .all(|((e, r, w), (e2, r2, w2))| r == r2 && w == w2 && e.same_structure(e2))
+            }
+            (
+                ProtoExpression::Ternary {
+                    cond,
+                    true_expr,
+                    false_expr,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::Ternary {
+                    cond: cond2,
+                    true_expr: true_expr2,
+                    false_expr: false_expr2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                width == width2
+                    && expr_context == expr_context2
+                    && cond.same_structure(cond2)
+                    && true_expr.same_structure(true_expr2)
+                    && false_expr.same_structure(false_expr2)
+            }
+            (
+                ProtoExpression::DynamicVariable {
+                    base_offset,
+                    stride,
+                    element_native_bytes,
+                    index_expr,
+                    num_elements,
+                    select,
+                    dynamic_select,
+                    width,
+                    expr_context,
+                },
+                ProtoExpression::DynamicVariable {
+                    base_offset: base_offset2,
+                    stride: stride2,
+                    element_native_bytes: element_native_bytes2,
+                    index_expr: index_expr2,
+                    num_elements: num_elements2,
+                    select: select2,
+                    dynamic_select: dynamic_select2,
+                    width: width2,
+                    expr_context: expr_context2,
+                },
+            ) => {
+                base_offset == base_offset2
+                    && stride == stride2
+                    && element_native_bytes == element_native_bytes2
+                    && num_elements == num_elements2
+                    && select == select2
+                    && width == width2
+                    && expr_context == expr_context2
+                    && index_expr.same_structure(index_expr2)
+                    && same_dyn(dynamic_select, dynamic_select2)
+            }
+            _ => false,
+        }
+    }
+
     /// Adjust all embedded byte offsets by the given deltas.
     /// FF offsets are shifted by `ff_delta`, comb offsets by `comb_delta`.
     pub fn adjust_offsets(&mut self, ff_delta: isize, comb_delta: isize) {
@@ -3136,6 +3330,23 @@ pub(crate) fn packed_range_row_type(
 }
 
 impl ProtoDynamicBitSelect {
+    fn same_structure(&self, other: &ProtoDynamicBitSelect) -> bool {
+        let ProtoDynamicBitSelect {
+            low_adjust,
+            row_elements,
+            index_expr,
+            elem_width,
+            window,
+            num_elements,
+        } = self;
+        *low_adjust == other.low_adjust
+            && *row_elements == other.row_elements
+            && *elem_width == other.elem_width
+            && *window == other.window
+            && *num_elements == other.num_elements
+            && index_expr.same_structure(&other.index_expr)
+    }
+
     pub(crate) fn storage_width(&self) -> usize {
         let elements = self.row_elements.map_or(self.num_elements, |row| {
             self.num_elements / ((row + self.low_adjust).next_power_of_two()) * row

@@ -19344,6 +19344,130 @@ fn constant_loop_lowering_keeps_an_over_budget_loop() {
 }
 
 /// Outside reset an `always_ff` loop is logic, like a comb loop.
+/// Read as runtime values, the `let` node numbers would make every node
+/// access a runtime index over the whole array, and the two calls sharing the
+/// function's scratch would look like they need another settle pass.
+#[test]
+fn constant_loop_lowering_reads_a_let_of_an_iteration_as_its_constant() {
+    let code = r#"
+    module Top (
+        a0: input  logic<4> ,
+        a1: input  logic<4> ,
+        t : input  logic<12>,
+        fa: input  logic<4> ,
+        o0: output logic<4> ,
+        o1: output logic<4> ,
+        fy: output logic<4> ,
+    ) {
+        function oldest (
+            v  : input logic<4>    ,
+            age: input logic<3> [4],
+        ) -> logic<4> {
+            var hv: logic    [8];
+            var ht: logic<3> [8];
+            var hi: logic<2> [8];
+            var r : logic<4>    ;
+            for i in 0..4 {
+                let leaf: u32 = 4 + i;
+                hv[leaf] = v[i];
+                ht[leaf] = age[i];
+                hi[leaf] = i;
+            }
+            for j in 1..4 {
+                let n    : u32   = 4 - j;
+                let right: logic = hv[2 * n + 1] && (!hv[2 * n] || ht[2 * n + 1] <: ht[2 * n]);
+                hv[n] = hv[2 * n] || hv[2 * n + 1];
+                ht[n] = if right ? ht[2 * n + 1] : ht[2 * n];
+                hi[n] = if right ? hi[2 * n + 1] : hi[2 * n];
+            }
+            for i in 0..4 {
+                r[i] = hv[1] && hi[1] == i;
+            }
+            return r;
+        }
+        var age: logic<3> [4];
+        var a  : logic<4> [2];
+        var o  : logic<4> [2];
+        always_comb {
+            for i in 0..4 {
+                age[i] = t[3 * i+:3];
+            }
+        }
+        assign a[0] = a0;
+        assign a[1] = a1;
+        always_comb {
+            for i in 0..2 {
+                var req: logic<4>;
+                for e in 0..4 {
+                    req[e] = a[i][e];
+                }
+                o[i] = oldest(req, age);
+            }
+        }
+        assign o0 = o[0];
+        assign o1 = o[1];
+        // A block reassigning a variable is not kept whole, so the
+        // statements above are ordered one by one.
+        var ft : logic<4>;
+        var fx : logic<4>;
+        var fx2: logic<4>;
+        always_comb {
+            ft = fa;
+            fx = ft;
+            ft = ~fa;
+            fy = ft ^ fx2;
+        }
+        always_comb {
+            fx2 = fx + 1;
+        }
+    }
+    "#;
+    let oldest = |v: u64, t: u64| -> u64 {
+        let age = |i: u64| (t >> (3 * i)) & 7;
+        (0..4)
+            .filter(|&i| v >> i & 1 == 1)
+            .min_by_key(|&i| (age(i), i))
+            .map_or(0, |i| 1 << i)
+    };
+    for config in [
+        Config::default(),
+        Config {
+            use_jit: true,
+            ..Default::default()
+        },
+    ] {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        for (a0, a1, t, fa) in [
+            (0b0110u64, 0b1001u64, 0o0123u64, 3u64),
+            (0b1111, 0b0000, 0o3210, 9),
+            (0b1010, 0b0111, 0o7777, 15),
+            (0b0001, 0b1100, 0o0516, 0),
+        ] {
+            sim.set("a0", Value::new(a0, 4, false));
+            sim.set("a1", Value::new(a1, 4, false));
+            sim.set("t", Value::new(t, 12, false));
+            sim.set("fa", Value::new(fa, 4, false));
+            let get = |sim: &mut Simulator, name: &str| sim.get(name).unwrap().payload_u64();
+            assert_eq!(
+                get(&mut sim, "o0"),
+                oldest(a0, t),
+                "{config:?} {a0:b} {t:o}"
+            );
+            assert_eq!(
+                get(&mut sim, "o1"),
+                oldest(a1, t),
+                "{config:?} {a1:b} {t:o}"
+            );
+            assert_eq!(
+                get(&mut sim, "fy"),
+                !fa & 0xf ^ ((fa + 1) & 0xf),
+                "{config:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn constant_loop_lowering_unrolls_an_over_budget_loop_outside_reset() {
     let code = r#"
@@ -31204,6 +31328,95 @@ fn an_unpacked_array_parameter_element_sizes_a_child() {
             config.use_jit,
             config.use_4state,
         );
+    }
+}
+
+/// Each iteration rewrites its temporaries before reading them: `k` under
+/// the guard it is read under, `s` bit by bit.  The next iteration's writes
+/// come later in the pass but never reach those reads.
+#[test]
+fn loop_temporaries_rewritten_each_iteration_settle_in_one_pass() {
+    let code = r#"
+    module Top (
+        x : input  logic<32>,
+        fa: input  logic<4> ,
+        y : output logic<32>,
+        z : output logic<4> ,
+        fy: output logic<4> ,
+    ) {
+        always_comb {
+            for l in 0..4 {
+                let kind: logic<4> = x[8 * l+:4];
+                if kind <: 5 || kind >= 12 {
+                    let k: logic<4> = x[8 * l + 4+:4] ^ kind;
+                    y[8 * l+:8] = {k, k + 4'd1};
+                } else {
+                    y[8 * l+:8] = {kind, 4'd0};
+                }
+            }
+        }
+        always_comb {
+            for e in 0..4 {
+                var s: logic<4>;
+                for w in 0..4 {
+                    s[w] = x[8 * w + e];
+                }
+                z[e] = |s;
+            }
+        }
+        // A block reassigning a variable is not kept whole, so the
+        // statements above are ordered one by one.
+        var ft : logic<4>;
+        var fx : logic<4>;
+        var fx2: logic<4>;
+        always_comb {
+            ft = fa;
+            fx = ft;
+            ft = ~fa;
+            fy = ft ^ fx2;
+        }
+        always_comb {
+            fx2 = fx + 1;
+        }
+    }
+    "#;
+    let expect = |x: u64| -> (u64, u64) {
+        let mut y = 0;
+        let mut z = 0;
+        for l in 0..4 {
+            let kind = (x >> (8 * l)) & 0xf;
+            let byte = if !(5..12).contains(&kind) {
+                let k = ((x >> (8 * l + 4)) & 0xf) ^ kind;
+                (k << 4) | ((k + 1) & 0xf)
+            } else {
+                kind << 4
+            };
+            y |= byte << (8 * l);
+        }
+        for e in 0..4 {
+            if (0..4).any(|w| x >> (8 * w + e) & 1 == 1) {
+                z |= 1 << e;
+            }
+        }
+        (y, z)
+    };
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        assert_eq!(ir.required_comb_passes, 1, "{config:?}");
+        let mut sim = Simulator::new(ir, None);
+        for x in [
+            0x0000_0000u64,
+            0x1234_5678,
+            0xc3a5_0f1e,
+            0x8888_0001,
+            0xffff_ffff,
+        ] {
+            sim.set("x", Value::new(x, 32, false));
+            sim.set("fa", Value::new(x & 0xf, 4, false));
+            let (y, z) = expect(x);
+            assert_eq!(sim.get("y").unwrap().payload_u64(), y, "{config:?} {x:x}");
+            assert_eq!(sim.get("z").unwrap().payload_u64(), z, "{config:?} {x:x}");
+        }
     }
 }
 
