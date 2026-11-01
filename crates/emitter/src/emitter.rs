@@ -2582,6 +2582,66 @@ impl Emitter {
         true
     }
 
+    fn emit_cast_for_assignment(&mut self, rhs: &Expression) -> bool {
+        let Some(lhs) = self.assignment_lefthand_side.as_ref() else {
+            return false;
+        };
+        if lhs.expression_identifier_opt.is_some()
+            || !lhs.expression_identifier_list.is_empty()
+            || !lhs.expression_identifier_list0.is_empty()
+        {
+            return false;
+        }
+        let token = lhs.identifier().clone();
+        let symbol = symbol_table::resolve(lhs).ok();
+        self.emit_cast_for_enum_assignment(&token, symbol, rhs)
+    }
+
+    /// Opens an `Enum'(` cast when a non-enum value is assigned to an enum
+    /// variable, which SystemVerilog rejects without an explicit cast (IEEE
+    /// 1800-2023 6.19.3). Returns true if the caller must close it with `)`.
+    fn emit_cast_for_enum_assignment(
+        &mut self,
+        token: &VerylToken,
+        lhs: Option<Rc<ResolveResult>>,
+        rhs: &Expression,
+    ) -> bool {
+        let Some(lhs) = lhs else {
+            return false;
+        };
+        let rhs_symbol = rhs
+            .unwrap_identifier()
+            .and_then(|x| symbol_table::resolve(x).ok())
+            .map(|x| x.found.clone());
+        // An enum member already has the enum type.
+        if matches!(
+            rhs_symbol.as_ref().map(|x| &x.kind),
+            Some(SymbolKind::EnumMember(_))
+        ) {
+            return false;
+        }
+        let Some(lhs_type) = lhs.found.kind.get_type().and_then(|x| x.get_user_defined()) else {
+            return false;
+        };
+        let is_enum = matches!(
+            self.resolve_generic_path(&lhs_type.path, Some(&lhs.found.namespace))
+                .0
+                .map(|x| x.found.kind.clone()),
+            Ok(SymbolKind::Enum(_))
+        );
+        if !is_enum {
+            return false;
+        }
+        let none = Vec::new();
+        self.emit_cast_for_connect_operand(
+            token,
+            &lhs.found,
+            &none,
+            rhs_symbol.as_deref(),
+            rhs_symbol.as_ref().map(|_| &none),
+        )
+    }
+
     fn emit_global_functions(&mut self, component_symbol: &Symbol) {
         let Some(func_paths) = symbol_table::get_reference_functions(component_symbol.id) else {
             unreachable!()
@@ -4590,7 +4650,11 @@ impl VerylWalker for Emitter {
                 self.expression(&arg.expression);
                 self.str(")");
             } else {
+                let cast_emitted = self.emit_cast_for_assignment(&arg.expression);
                 self.expression(&arg.expression);
+                if cast_emitted {
+                    self.str(")");
+                }
             }
         } else {
             self.align_start(align_kind::ASSIGNMENT);
@@ -4603,7 +4667,12 @@ impl VerylWalker for Emitter {
             }
             self.align_finish(align_kind::ASSIGNMENT);
             self.space(1);
+            let cast_emitted = matches!(&*arg.assignment_group, AssignmentGroup::Equ(_))
+                && self.emit_cast_for_assignment(&arg.expression);
             self.expression(&arg.expression);
+            if cast_emitted {
+                self.str(")");
+            }
         }
     }
 
@@ -5286,7 +5355,28 @@ impl VerylWalker for Emitter {
         self.space(1);
         self.equ(&arg.equ);
         self.space(1);
+        let cast_emitted = match &*arg.assign_destination {
+            AssignDestination::HierarchicalIdentifier(x)
+                if x.hierarchical_identifier
+                    .hierarchical_identifier_list
+                    .is_empty()
+                    && x.hierarchical_identifier
+                        .hierarchical_identifier_list0
+                        .is_empty() =>
+            {
+                let ident = &x.hierarchical_identifier;
+                self.emit_cast_for_enum_assignment(
+                    &ident.identifier.identifier_token,
+                    symbol_table::resolve(ident.as_ref()).ok(),
+                    &arg.expression,
+                )
+            }
+            _ => false,
+        };
         self.expression(&arg.expression);
+        if cast_emitted {
+            self.str(")");
+        }
         self.semicolon(&arg.semicolon);
     }
 

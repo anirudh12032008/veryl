@@ -1,0 +1,31 @@
+module veryl_testcase_Module98 (
+    clk: input  clock   ,
+    i  : input  logic<2>,
+    o0 : output logic   ,
+    o1 : output logic   ,
+    o2 : output logic   ,
+    o3 : output logic   ,
+) {
+    enum Color: logic<2> {
+        Red,
+        Green,
+        Blue,
+    }
+
+    var c0: Color;
+    var c1: Color;
+    var c2: Color;
+    var c3: Color;
+    assign c0 = i;
+    always_comb {
+        c1 = 2'd2;
+        c3 = Color::Green;
+    }
+    always_ff (clk) {
+        c2 = i;
+    }
+    assign o0 = c0 == Color::Blue;
+    assign o1 = c1 == Color::Blue;
+    assign o2 = c2 == Color::Blue;
+    assign o3 = c3 == c0;
+}
