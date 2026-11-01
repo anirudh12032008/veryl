@@ -2726,7 +2726,7 @@ impl Conv<&air::InstDeclaration> for ProtoDeclaration {
             // No assignment statement here to size the literal.
             size_literal_rhs(&mut proto_expr, None, None, child_meta.width);
             let element = &child_meta.elements[0];
-            all_comb_statements.push(ProtoStatement::Assign(ProtoAssignStatement {
+            let assign = ProtoStatement::Assign(ProtoAssignStatement {
                 dst: element.current,
                 dst_width: child_meta.width,
                 select: None,
@@ -2736,7 +2736,19 @@ impl Conv<&air::InstDeclaration> for ProtoDeclaration {
                 dst_ff_current_offset: 0, // not FF
                 comb_direct: false,
                 token: TokenRange::default(),
-            }));
+            });
+            // A function call in the connection is inlined into pending
+            // statements, which must run before the port is assigned; left
+            // pending, they are flushed into whatever block converts next.
+            // They form one block like a `let`, so the function's sequential
+            // reassignments keep their order when statements are sorted.
+            if context.pending_statements.is_empty() {
+                all_comb_statements.push(assign);
+            } else {
+                let mut block = std::mem::take(&mut context.pending_statements);
+                block.push(assign);
+                all_comb_statements.push(ProtoStatement::SequentialBlock(block));
+            }
         }
 
         // Output ports: child port var → parent dst.  A concat destructure

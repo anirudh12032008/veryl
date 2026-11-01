@@ -10896,6 +10896,31 @@ fn unassign_variable() {
 
     let errors = analyze(code);
     assert!(matches!(errors[0], AnalyzerError::UnassignVariable { .. }));
+
+    // An array output argument assigns every element it binds.
+    let code = r#"
+    module ModuleA (
+        x: input  logic<2>       ,
+        o: output logic<2> [2]   ,
+        p: output logic<2> [2, 2],
+    ) {
+        function f (
+            a: input  logic<2>    ,
+            c: output logic<2> [2],
+        ) {
+            c[0] = a;
+            c[1] = ~a;
+        }
+        always_comb {
+            f(x, o);
+            f(x, p[0]);
+            f(x, p[1]);
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]

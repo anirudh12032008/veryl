@@ -425,6 +425,9 @@ impl FunctionCall {
                     let Some(variable) = context.get_variable_info(dst.id) else {
                         continue;
                     };
+                    let Some((first, last)) = variable.r#type.array.calc_range(&index) else {
+                        continue;
+                    };
                     if let Some((beg, end)) = dst.select.conservative_packed_range(
                         context,
                         &variable.r#type,
@@ -432,14 +435,21 @@ impl FunctionCall {
                     ) {
                         let mask = ValueBigUint::gen_mask_range(beg, end);
                         let dynamic = !dst.index.is_const() || !dst.select.is_const_with_range();
-                        assign_table.insert_assign(
-                            &variable,
-                            index,
-                            mask,
-                            dynamic,
-                            dynamic,
-                            self.comptime.token,
-                        );
+                        for i in first..=last {
+                            let Some(index) =
+                                VarIndex::from_index(i, &variable.r#type.array).eval_value(context)
+                            else {
+                                continue;
+                            };
+                            assign_table.insert_assign(
+                                &variable,
+                                index,
+                                mask.clone(),
+                                dynamic,
+                                dynamic,
+                                self.comptime.token,
+                            );
+                        }
                     }
                 }
             }
