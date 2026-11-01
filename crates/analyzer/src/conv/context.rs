@@ -127,6 +127,11 @@ pub struct Context {
     /// evaluator walks straight past it and the LAST `return` wins.
     pub function_ret_var: Option<VarId>,
     pub function_returned: bool,
+    /// Set when the function being constant-evaluated reached a branch or
+    /// loop whose condition or bound is unknown, or a write it could not
+    /// perform. Skipping that code leaves stale values behind, so the call
+    /// result is unknown too.
+    pub function_indeterminate: bool,
     pub select_paths: Vec<(VarPath, GenericSymbolPath)>,
     pub select_dims: Vec<usize>,
     pub ignore_var_func: bool,

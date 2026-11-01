@@ -35396,6 +35396,44 @@ fn folded_const_select_keeps_its_sign() {
 }
 
 #[test]
+fn overridden_param_default_not_evaluated() {
+    let code = r#"
+    module Sub #(
+        param N  : u32          = 1      ,
+        param TBL: logic<8> [N] = '{8'd0},
+    ) (
+        y0: output logic<8>,
+        y1: output logic<8>,
+    ) {
+        assign y0 = TBL[0];
+        assign y1 = TBL[N - 1];
+    }
+    module Top (
+        a : input  logic<8>,
+        y0: output logic<8>,
+        y1: output logic<8>,
+    ) {
+        const T: logic<8> [2] = '{8'd1, 8'd2};
+        inst u: Sub #(
+            N  : 2,
+            TBL: T,
+        ) (
+            y0,
+            y1,
+        );
+    }
+    "#;
+    check_all_configs(
+        code,
+        &[("a", Value::new(0, 8, false))],
+        &[
+            ("y0", Value::new(1, 8, false)),
+            ("y1", Value::new(2, 8, false)),
+        ],
+    );
+}
+
+#[test]
 fn runtime_for_bound_keeps_its_type() {
     // `j < N` compares unsigned when `N` is unsigned, so a negative start
     // runs no iteration; a bound is evaluated at the 32-bit `int` width, so
@@ -37973,5 +38011,44 @@ fn a_field_write_after_a_runtime_index_write_to_its_element_merges_with_it() {
             Value::new(0xa5, 8, false),
             "{config:?}"
         );
+    }
+}
+
+#[test]
+fn struct_member_of_param_array_sized_by_earlier_param() {
+    let code = r#"
+    package pk {
+        struct Region {
+            base: logic<32>,
+            mask: logic<8> ,
+        }
+    }
+    module Top #(
+        param N: u32            = 2,
+        param W: pk::Region [N] = '{
+            pk::Region'{ base: 32'h11, mask: 8'h22 },
+            pk::Region'{ base: 32'h33, mask: 8'h44 }
+        },
+    ) (
+        i: input  logic    ,
+        o: output logic<32>,
+        m: output logic<8> ,
+    ) {
+        assign o = W[i].base;
+        assign m = W[1].mask;
+    }
+    "#;
+
+    for config in Config::all() {
+        dbg!(&config);
+
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        for (i, exp) in [(0, 0x11), (1, 0x33)] {
+            sim.set("i", Value::new(i, 1, false));
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            assert_eq!(sim.get("o").unwrap(), Value::new(exp, 32, false));
+            assert_eq!(sim.get("m").unwrap(), Value::new(0x44, 8, false));
+        }
     }
 }

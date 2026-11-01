@@ -287,8 +287,11 @@ fn eval_range_inner(
             &range.into(),
         ));
     }
-    let beg = if beg_comptime.is_const {
-        let value = beg_comptime.get_value()?;
+    // A const bound may still have no value, e.g. a proto package constant
+    // seen from inside a generic; it stays an expression to evaluate later.
+    let beg = if beg_comptime.is_const
+        && let Ok(value) = beg_comptime.get_value()
+    {
         // A strictly negative bound (signed value <= 0, nonzero payload)
         // would wrap through to_usize into a huge unsigned ForBound.
         if value.is_semantically_not_positive() && value.is_positive() {
@@ -314,8 +317,9 @@ fn eval_range_inner(
                 &range.into(),
             ));
         }
-        let end = if end_comptime.is_const {
-            let value = end_comptime.get_value()?;
+        let end = if end_comptime.is_const
+            && let Ok(value) = end_comptime.get_value()
+        {
             if value.is_semantically_not_positive() && value.is_positive() {
                 let token: TokenRange = range.into();
                 context.insert_error(AnalyzerError::invalid_for_range(
@@ -1029,7 +1033,21 @@ fn insert_const_variable(
     comptime: Comptime,
     values: Vec<Value>,
 ) {
+    let token = comptime.token;
     let id = context.insert_var_path(dst.path.clone(), comptime);
+
+    // Without member paths, `X[i].member` falls back to the symbol route, which
+    // re-evaluates the declared type outside the component and loses its
+    // earlier parameters.
+    for x in r#type.expand_struct_union(&dst.path, &[], None) {
+        let r#type = x.part_select.last().unwrap().r#type.clone();
+        let mut comptime = Comptime::from_type(r#type, ClockDomain::None, token);
+        comptime.is_const = true;
+        let path = x.path.clone();
+        comptime.part_select = Some(x);
+        context.insert_var_path_with_id(path, id, comptime);
+    }
+
     let array_limit = context.config.evaluate_array_limit;
     let variable = Variable::new(
         id,
@@ -1236,17 +1254,22 @@ fn check_reset_non_elaborative(context: &mut Context, expr: &mut ir::Expression)
     } else {
         let mut specialized = Some(expr.clone());
         for (id, range) in context.for_ranges.clone() {
-            let Some(iterations) = range.eval_iter(context) else {
-                continue;
-            };
-            let Some(iteration) = iterations.first() else {
-                continue;
+            // A const bound without a value yet, like a proto package constant
+            // inside a generic, still makes the iterator elaborative; any value
+            // shows whether the rest is.
+            let iteration = match range.eval_iter(context) {
+                Some(iterations) => match iterations.first() {
+                    Some(x) => *x,
+                    None => continue,
+                },
+                None if range.has_const_bounds() => 0,
+                None => continue,
             };
             let variable = &context.variables[&id];
             let Some(width) = variable.r#type.total_width() else {
                 continue;
             };
-            let value = Value::new(*iteration as u64, width, variable.r#type.signed);
+            let value = Value::new(iteration as u64, width, variable.r#type.signed);
             specialized = specialized
                 .and_then(|expr| ir::peel::specialize_expression(context, &expr, id, value));
         }

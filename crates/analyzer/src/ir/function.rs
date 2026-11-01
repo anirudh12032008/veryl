@@ -327,6 +327,7 @@ impl FunctionCall {
         // in the body itself must not inherit this frame's return state.
         let prior_ret_var = std::mem::replace(&mut context.function_ret_var, func.ret);
         let prior_returned = std::mem::replace(&mut context.function_returned, false);
+        let prior_indeterminate = std::mem::replace(&mut context.function_indeterminate, false);
         for x in &func.statements {
             if x.eval_value(context) == crate::ir::ControlFlow::Break {
                 break;
@@ -334,6 +335,8 @@ impl FunctionCall {
         }
         context.function_ret_var = prior_ret_var;
         context.function_returned = prior_returned;
+        let indeterminate =
+            std::mem::replace(&mut context.function_indeterminate, prior_indeterminate);
         let overflowed = context.comptime_for_overflow.is_some();
         if let Some(x) = prior_overflow {
             context.comptime_for_overflow.get_or_insert(x);
@@ -344,7 +347,7 @@ impl FunctionCall {
 
         // A skipped over-limit for loop leaves the return value at its
         // pre-loop state; treat the call as unevaluable instead.
-        if overflowed {
+        if overflowed || indeterminate {
             return None;
         }
 
