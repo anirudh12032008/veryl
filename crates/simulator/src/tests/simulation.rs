@@ -28254,6 +28254,50 @@ fn ff_outside_comb_reach_advances_under_a_constant_comb() {
 }
 
 #[test]
+fn event_display_prints_once_under_validation() {
+    let code = r#"
+    module Top (
+        clk: input  clock   ,
+        a  : input  logic<8>,
+        o  : output logic<8>,
+    ) {
+        always_ff (clk) {
+            if a == 8'd7 {
+                $display("hit a=%h o=%h", a, o);
+            }
+            o = a;
+        }
+    }
+    "#;
+
+    let mut configs = Config::all();
+    if crate::tests::aot_c_loads() {
+        configs.push(aot_native_validate_config());
+    }
+    let mut seen: Option<String> = None;
+    for config in configs {
+        output_buffer::enable();
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+        let clk = sim.get_clock("clk").unwrap();
+        for a in [5u64, 7, 7, 9] {
+            sim.set("a", Value::new(a, 8, false));
+            sim.step(&clk);
+        }
+        let output = output_buffer::take();
+        assert_eq!(
+            output.matches("hit a=07").count(),
+            2,
+            "config={config:?} output={output:?}"
+        );
+        match &seen {
+            None => seen = Some(output),
+            Some(first) => assert_eq!(&output, first, "config={config:?}"),
+        }
+    }
+}
+
+#[test]
 fn comb_display_output_matches_across_backends() {
     // `$display` inside an `always_comb` is a side effect in a place the comb
     // backends may otherwise reorder or skip.  The dataflow plan keeps a cell
