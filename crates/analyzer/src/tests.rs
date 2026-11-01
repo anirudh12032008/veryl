@@ -4534,6 +4534,53 @@ fn incompat_proto() {
 
     let errors = analyze(code);
     assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
+
+    // Generic arguments spelled the same can name different symbols.
+    let code = r#"
+    package A { const W: u32 = 4; }
+    package B { const W: u32 = 8; }
+    package G::<N: u32> { type S = logic<N>; }
+    proto package ProtoPkg {
+        import A::*;
+        const C: G::<W>::S;
+    }
+    package Pkg for ProtoPkg {
+        import B::*;
+        const C: prj::G::<W>::S = 0;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
+
+    let code = r#"
+    package A { const W: u32 = 4; }
+    package G::<N: u32> { type S = logic<N>; }
+    proto package ProtoPkg {
+        const C: G::<A::W>::S;
+    }
+    package Pkg for ProtoPkg {
+        import A::*;
+        const C: G::<W>::S = 0;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let code = r#"
+    proto package ProtoPkg {
+        struct Foo { foo: u32, }
+        const FOO: Foo;
+    }
+    package Pkg::<V: u32> for ProtoPkg {
+        struct Foo { foo: u32, }
+        const FOO: Foo = Foo'{foo: V};
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]
