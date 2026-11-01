@@ -1,0 +1,40 @@
+interface InterfaceSameModport {
+    var req : logic<8>;
+    var resp: logic<8>;
+    modport left {
+        req : output,
+        resp: input ,
+    }
+    modport right {
+        req : input ,
+        resp: output,
+    }
+    modport left_relay {
+        ..same(left)
+    }
+}
+
+module ModuleSameModportLeaf (
+    p: modport InterfaceSameModport::left,
+) {
+    assign p.req = 8'h5a;
+}
+
+module ModuleSameModportMid (
+    p: modport InterfaceSameModport::left_relay,
+) {
+    inst u: ModuleSameModportLeaf (
+        p,
+    );
+}
+
+module ModuleSameModportTop (
+    o: output logic<8>,
+) {
+    inst bus: InterfaceSameModport;
+    inst m: ModuleSameModportMid (
+        p: bus,
+    );
+    assign bus.resp = 8'h00;
+    assign o        = bus.req;
+}

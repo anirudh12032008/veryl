@@ -7216,13 +7216,28 @@ pub fn symbol_string(
             ret.push('_');
             ret.push_str(&token_text);
         }
-        SymbolKind::Modport(_) => {
+        SymbolKind::Modport(x) => {
             ret.push_str(&namespace_string(
                 &symbol.namespace,
                 generic_tables,
                 context,
             ));
-            ret.push_str(&token_text);
+            // SystemVerilog needs the modport names of connected ports to match,
+            // so a modport that is only `..same(target)` is emitted as the target.
+            match &x.default {
+                Some(veryl_analyzer::symbol::ModportDefault::Same(targets))
+                    if context.in_direction_modport
+                        && targets.len() == 1
+                        && x.members.iter().all(|id| {
+                            symbol_table::get(*id).is_some_and(|m| {
+                                matches!(m.token.source, TokenSource::Generated(_))
+                            })
+                        }) =>
+                {
+                    ret.push_str(&targets[0].text.to_string());
+                }
+                _ => ret.push_str(&token_text),
+            }
         }
         SymbolKind::SystemVerilog => {
             ret.push_str(&namespace_string(
