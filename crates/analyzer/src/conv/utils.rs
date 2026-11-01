@@ -5297,6 +5297,29 @@ pub fn check_compatibility(
     }
 }
 
+/// Report a struct or union bound to a function argument of another struct or
+/// union type. The rest of `check_compatibility` is not applied to arguments,
+/// but such a value would be silently truncated or zero-extended.
+pub fn check_function_arg_aggregate(
+    context: &mut Context,
+    dst: &ir::Type,
+    src: &ir::Type,
+    token: &TokenRange,
+) {
+    if let Some(dst_id) = dst.kind.aggregate_id()
+        && let Some(src_id) = src.kind.aggregate_id()
+        && dst_id != src_id
+    {
+        context.insert_error(AnalyzerError::mismatch_assignment(
+            &src.to_string(),
+            &dst.to_string(),
+            MismatchAssignmentKind::Normal,
+            token,
+            &[],
+        ));
+    }
+}
+
 /// Reject implicit conversion to a clock/reset-typed input port or
 /// function argument.  `$sv` ports are SystemVerilog-typed and never
 /// reach this check, which keeps the SystemVerilog boundary unchecked

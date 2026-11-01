@@ -8196,6 +8196,48 @@ fn interface_parameter_override() {
 }
 
 #[test]
+fn always_ff_under_inactive_ifdef_is_dropped() {
+    let code = r#"
+    module Top (
+        clk: input  clock,
+        rst: input  reset,
+        o  : output logic,
+    ) {
+        #[ifdef(CHK)]
+        {
+            var q: logic;
+            always_ff {
+                if_reset {
+                    q = 0;
+                } else {
+                    q = 1;
+                }
+            }
+            assign o = q;
+        }
+        #[ifndef(CHK)]
+        assign o = 0;
+    }
+    "#;
+
+    for config in Config::all() {
+        let ir = analyze(code, &config);
+        let mut sim = Simulator::new(ir, None);
+
+        let clk = sim.get_clock("clk").unwrap();
+        let rst = sim.get_reset("rst").unwrap();
+
+        sim.step_reset(&clk, &rst);
+        sim.step(&clk);
+        assert_eq!(
+            sim.get("o").unwrap(),
+            Value::new(0, 1, false),
+            "config={config:?}"
+        );
+    }
+}
+
+#[test]
 fn a_parameter_typed_by_another_parameter_takes_the_override() {
     // Regression: a parameter whose declared width names another parameter was
     // sized with that parameter's DEFAULT, so `#(W: 5, V: 16)` on
@@ -19577,7 +19619,7 @@ fn assert_matches_runtime_loop_allowing(
     allow: Allowed,
 ) {
     let analyze =
-        |code: &str, config: &Config| analyze_top_inner(code, config, "Top", allow).unwrap();
+        |code: &str, config: &Config| analyze_top_inner(code, config, "Top", allow, &[]).unwrap();
     for config in Config::all().into_iter().filter(configs) {
         let mut sim = Simulator::new(analyze(code, &config), None);
         let mut reference = Simulator::new(analyze(control, &config), None);
@@ -38049,6 +38091,64 @@ fn struct_member_of_param_array_sized_by_earlier_param() {
             sim.step(&Event::clock(VarId::SYNTHETIC));
             assert_eq!(sim.get("o").unwrap(), Value::new(exp, 32, false));
             assert_eq!(sim.get("m").unwrap(), Value::new(0x44, 8, false));
+        }
+    }
+}
+
+#[test]
+fn ifdef_package_items_follow_defines() {
+    let code = r#"
+    package pk {
+        #[ifdef(SEL_A)]
+        const C: u32 = 2;
+        #[elsif(SEL_B)]
+        const C: u32 = 4;
+        #[else]
+        const C: u32 = 14;
+
+        #[ifdef(SEL_A)]
+        type T = logic<8>;
+        #[else]
+        type T = logic<4>;
+
+        #[ifdef(SEL_A)]
+        function f () -> logic<8> {
+            return 8'd200;
+        }
+        #[else]
+        function f () -> logic<8> {
+            return 8'd7;
+        }
+    }
+    module Top (
+        c: output logic<8>,
+        t: output logic<8>,
+        r: output logic<8>,
+    ) {
+        var x: pk::T;
+        assign x = '1;
+        assign c = pk::C;
+        assign t = x;
+        assign r = pk::f();
+    }
+    "#;
+
+    for (defines, exp) in [
+        (&[][..], [14, 15, 7]),
+        (&["SEL_A"][..], [2, 255, 200]),
+        (&["SEL_B"][..], [4, 15, 7]),
+    ] {
+        for config in Config::all() {
+            let ir = analyze_with_defines(code, &config, defines);
+            let mut sim = Simulator::new(ir, None);
+            sim.step(&Event::clock(VarId::SYNTHETIC));
+            for (name, exp) in ["c", "t", "r"].iter().zip(exp) {
+                assert_eq!(
+                    sim.get(name).unwrap(),
+                    Value::new(exp, 8, false),
+                    "{name} defines={defines:?} config={config:?}"
+                );
+            }
         }
     }
 }

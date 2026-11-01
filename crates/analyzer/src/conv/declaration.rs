@@ -49,6 +49,14 @@ use veryl_parser::veryl_token::Token;
 
 impl Conv<&GenerateItem> for ir::DeclarationBlock {
     fn conv(context: &mut Context, value: &GenerateItem) -> IrResult<Self> {
+        // Not every declaration kind checks this itself: an inactive
+        // `always_ff` would otherwise keep its clock and reset without a body.
+        let range: TokenRange = value.into();
+        let define_context: DefineContext = range.beg.into();
+        if !define_context.is_active(&context.config.defines) {
+            return Ok(ir::DeclarationBlock::default());
+        }
+
         match value {
             GenerateItem::LetDeclaration(x) => Ok(ir::DeclarationBlock::new(Conv::conv(
                 context,

@@ -137,6 +137,7 @@ fn analyze_with_defines(code: &str, defines: &[&str]) -> Vec<AnalyzerError> {
         .iter()
         .map(|x| resource_table::insert_str(x))
         .collect();
+    symbol_table::set_defines(&context.config.defines);
     let mut ir = Ir::default();
 
     let mut errors = vec![];
@@ -4492,6 +4493,47 @@ fn incompat_proto() {
 
     let errors = analyze(code);
     assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
+
+    // A type named through an import is the same type as its qualified name.
+    let code = r#"
+    package TypePkg {
+        type T = logic<4>;
+        type U = logic<4>;
+    }
+    proto package ProtoPkg {
+        const A: TypePkg::T;
+        type B = TypePkg::T;
+        function f (a: input TypePkg::T) -> TypePkg::T;
+    }
+    package Pkg for ProtoPkg {
+        import TypePkg::*;
+        const A: T = 4'd3;
+        type B = T;
+        function f (a: input T) -> T {
+            return a;
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let code = r#"
+    package TypePkg {
+        type T = logic<4>;
+        type U = logic<4>;
+    }
+    proto package ProtoPkg {
+        const A: TypePkg::T;
+    }
+    package Pkg for ProtoPkg {
+        import TypePkg::*;
+        const A: U = 4'd3;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(matches!(errors[0], AnalyzerError::IncompatProto { .. }));
 }
 
 #[test]
@@ -5786,6 +5828,111 @@ fn array_slice_shape_mismatch() {
             ..
         }
     ));
+}
+
+#[test]
+fn mismatch_function_arg_struct_type() {
+    let code = r#"
+    package PackageA {
+        struct StructA {
+            x: logic<8>,
+            y: logic<4>,
+        }
+        struct StructB {
+            x: logic<8>,
+        }
+        type AliasB = StructB;
+        function FuncA (
+            b: input StructB,
+        ) -> logic {
+            return b.x[0];
+        }
+        function FuncB (
+            a: input  StructA,
+            b: output StructB,
+        ) {
+            b = a.x as StructB;
+        }
+    }
+    module ModuleA (
+        i_a: input  PackageA::StructA,
+        o_x: output logic,
+    ) {
+        assign o_x = PackageA::FuncA(i_a);
+    }
+    module ModuleB (
+        i_a: input  PackageA::StructA,
+        o_a: output PackageA::StructA,
+    ) {
+        always_comb {
+            PackageA::FuncB(i_a, o_a);
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, AnalyzerError::MismatchAssignment { .. })),
+        "{errors:?}"
+    );
+
+    // The same struct, through an alias, a member, a plain logic value or a
+    // generic package, still binds.
+    let code = r#"
+    package PackageA::<W: u32> {
+        struct StructB {
+            x: logic<W>,
+        }
+        type AliasB = StructB;
+        struct StructA {
+            b: StructB,
+            y: logic<4>,
+        }
+        function FuncA (
+            b: input AliasB,
+        ) -> logic {
+            return b.x[0];
+        }
+        function FuncB (
+            b: output StructB,
+        ) {
+            b = 0;
+        }
+    }
+    module ModuleA::<W: u32> (
+        i_a: input  PackageA::<W>::StructA,
+        i_b: input  PackageA::<W>::StructB,
+        i_l: input  logic<W>,
+        o_x: output logic<4>,
+        o_b: output PackageA::<W>::AliasB,
+    ) {
+        var s: PackageA::<W>::StructA;
+        always_comb {
+            s      = i_a;
+            o_x[0] = PackageA::<W>::FuncA(i_a.b);
+            o_x[1] = PackageA::<W>::FuncA(i_b);
+            o_x[2] = PackageA::<W>::FuncA(i_l);
+            o_x[3] = PackageA::<W>::FuncA(i_a.b as PackageA::<W>::StructB);
+            PackageA::<W>::FuncB(o_b);
+            PackageA::<W>::FuncB(s.b);
+        }
+    }
+    module ModuleB (
+        i_a: input  PackageA::<8>::StructA,
+        i_b: input  PackageA::<8>::StructB,
+        i_l: input  logic<8>,
+        o_x: output logic<4>,
+        o_b: output PackageA::<8>::StructB,
+    ) {
+        inst u: ModuleA::<8> (i_a, i_b, i_l, o_x, o_b);
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]
@@ -8384,6 +8531,35 @@ fn referring_before_definition() {
             .iter()
             .any(|x| matches!(x, AnalyzerError::InvalidAssignment { .. }))
     );
+}
+
+#[test]
+fn inactive_ifdef_module_is_not_analyzed() {
+    let code = r#"
+    #[ifdef(FOO)]
+    module ModuleA (
+        clk: input  clock,
+        rst: input  reset,
+        i_a: input  logic,
+        o_a: output logic,
+    ) {
+        var q: logic;
+        always_ff {
+            if_reset {
+                q = 0;
+            } else {
+                q = i_a;
+            }
+        }
+        assign o_a = q;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let errors = analyze_with_defines(code, &["FOO"]);
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]
@@ -23305,6 +23481,60 @@ fn concatenation_assignment_contributes_function_effects() {
             .iter()
             .any(|x| matches!(x, AnalyzerError::FunctionOutputInAlwaysFf { .. }))
     );
+}
+
+#[test]
+fn ifdef_package_function_resolves_to_active_variant() {
+    let code = r#"
+    package PackageA {
+        #[ifdef(FEATURE)]
+        function f () -> logic<8> {
+            return 1;
+        }
+        #[else]
+        function f () -> logic<8> {
+            return 2;
+        }
+    }
+    module ModuleA (
+        o: output logic<8>,
+    ) {
+        assign o = PackageA::f();
+    }
+    "#;
+
+    let errors = analyze_with_defines(code, &[]);
+    assert!(errors.is_empty());
+
+    let errors = analyze_with_defines(code, &["FEATURE"]);
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn ifdef_struct_member_resolves_to_active_variant_before_pass2() {
+    // `s.b` is resolved when references are applied after pass1.
+    let code = r#"
+    package PackageA {
+        #[ifdef(FEATURE)]
+        struct S {
+            b: logic<8>,
+        }
+        #[else]
+        struct S {
+            a: logic<8>,
+        }
+    }
+    module ModuleA (
+        o: output logic<8>,
+    ) {
+        var s: PackageA::S;
+        assign s.b = 1;
+        assign o   = s.b;
+    }
+    "#;
+
+    let errors = analyze_with_defines(code, &["FEATURE"]);
+    assert!(errors.is_empty());
 }
 
 #[test]

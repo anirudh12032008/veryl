@@ -1,6 +1,7 @@
 use crate::conv::Context;
 use crate::conv::utils::{
-    check_compatibility, check_implicit_clock_conversion, eval_array_literal,
+    check_compatibility, check_function_arg_aggregate, check_implicit_clock_conversion,
+    eval_array_literal,
 };
 use crate::ir::assign_table::{AssignContext, AssignTable};
 use crate::ir::ff_table::AssignTarget;
@@ -227,6 +228,22 @@ pub(crate) fn array_arg_values(
             Some(values.into_iter().map(|v| v.select(high, low)).collect())
         }
         _ => None,
+    }
+}
+
+fn check_output_arg_aggregate(
+    context: &mut Context,
+    formal: &crate::ir::Type,
+    dst: &[AssignDestination],
+) {
+    // The type of a destination is that of the whole variable, so one naming
+    // a member or a part of it says nothing about the formal; neither does a
+    // concatenation of several.
+    if let [dst] = dst
+        && dst.path.0.len() == 1
+        && dst.select.is_empty()
+    {
+        check_function_arg_aggregate(context, &dst.comptime.r#type, formal, &dst.token);
     }
 }
 
@@ -722,7 +739,10 @@ impl Arguments {
                         // before it can be folded, just as an assignment does.
                         // Otherwise `f(2'b11 + 2'b01)` evaluates the addition
                         // at 2 bits even when `f` takes a wider argument.
-                        expr.eval_comptime(context, arg_type.total_width());
+                        let expr_comptime = expr.eval_comptime(context, arg_type.total_width());
+                        let expr_token = expr_comptime.token;
+                        let expr_type = expr_comptime.r#type.clone();
+                        check_function_arg_aggregate(context, arg_type, &expr_type, &expr_token);
                         if arg_type.is_clock() || arg_type.is_reset() {
                             let expr_comptime = expr.eval_comptime(context, None);
                             let expr_token = expr_comptime.token;
@@ -736,21 +756,24 @@ impl Arguments {
                         inputs.push((path.clone(), expr));
                     }
                     Direction::Output => {
-                        let dst = dst
+                        let dst: Vec<_> = dst
                             .into_iter()
                             .filter_map(|x| x.to_assign_destination(context, false))
                             .collect();
+                        check_output_arg_aggregate(context, &arg.comptime.r#type, &dst);
                         outputs.push((path.clone(), dst));
                     }
                     // `inout` is copy-in / copy-out: the actual is read on entry
                     // and written back on return.
                     Direction::Inout => {
-                        expr.eval_comptime(context, arg.comptime.r#type.total_width());
+                        let arg_type = &arg.comptime.r#type;
+                        expr.eval_comptime(context, arg_type.total_width());
                         inputs.push((path.clone(), expr));
-                        let dst = dst
+                        let dst: Vec<_> = dst
                             .into_iter()
                             .filter_map(|x| x.to_assign_destination(context, false))
                             .collect();
+                        check_output_arg_aggregate(context, arg_type, &dst);
                         outputs.push((path.clone(), dst));
                     }
                     _ => (),

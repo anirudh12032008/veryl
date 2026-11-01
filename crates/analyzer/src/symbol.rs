@@ -1528,7 +1528,40 @@ impl Type {
     }
 
     pub fn is_compatible(&self, other: &Type) -> bool {
-        self.to_string() == other.to_string()
+        if self.to_string() == other.to_string() {
+            return true;
+        }
+
+        // The same user-defined type can be spelled through different paths,
+        // e.g. `T` brought in by `import pkg::*` and `pkg::T`.
+        let (TypeKind::UserDefined(x), TypeKind::UserDefined(y)) = (&self.kind, &other.kind) else {
+            return false;
+        };
+        let resolve = |x: &UserDefinedType| {
+            let head = x.path.paths.first()?;
+            let path = SymbolPathNamespace::from_token(x.path.generic_path(), head.base.id);
+            symbol_table::resolve(path).ok().map(|x| x.found.id)
+        };
+        let arguments = |x: &UserDefinedType| {
+            x.path
+                .generic_arguments()
+                .iter()
+                .flatten()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (Some(x_id), Some(y_id)) = (resolve(x), resolve(y)) else {
+            return false;
+        };
+        if x_id != y_id || arguments(x) != arguments(y) {
+            return false;
+        }
+
+        let mut x = self.clone();
+        let mut y = other.clone();
+        x.kind = TypeKind::Inferred;
+        y.kind = TypeKind::Inferred;
+        x.to_string() == y.to_string()
     }
 
     pub fn has_modifier(&self, kind: &TypeModifierKind) -> bool {
